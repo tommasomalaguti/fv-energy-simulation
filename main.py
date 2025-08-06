@@ -5,8 +5,7 @@ Streamlit dashboard: Consumi & Produzione FV – 12 mesi (Feb 2024 → Gen 2025)
 Prerequisiti:
     pip install streamlit pandas plotly numpy
 
-Esecuzione (Windows):
-    cd C:\\Users\\TommasoMalaguti\\Desktop\\fv_sim_project
+Esecuzione locale (Windows):
     streamlit run main.py
 """
 
@@ -68,8 +67,8 @@ def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
     Restituisce Serie 'Band' con F1/F2/F3 per indice Europe/Rome.
     Regole:
       - Domenica e festivi: F3 tutto il giorno.
-      - Sabato: F2 07–22, altrimenti F3.
-      - Lun–Ven (non festivi): F1 08–18; F2 07 e 19–22; F3 resto.
+      - Sabato: F2 07–23 (cioè ore 7..22), altrimenti F3.
+      - Lun–Ven (non festivi): F1 08–19 (cioè ore 8..18); F2 07 e 19–23 (ore 7 e 19..22); F3 resto.
     """
     if index_tzaware.tz is None:
         raise ValueError("L'indice deve essere timezone-aware (Europe/Rome).")
@@ -78,54 +77,70 @@ def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
     for y in years:
         hol |= _italy_holidays(int(y))
 
-    dow = pd.Series(index_tzaware.weekday, index=index_tzaware)
+    dow = pd.Series(index_tzaware.weekday, index=index_tzaware)  # 0=Mon..6=Sun
     hour = pd.Series(index_tzaware.hour, index=index_tzaware)
     is_holiday = pd.Series([ts.date() in hol for ts in index_tzaware], index=index_tzaware, dtype=bool)
 
     bands = pd.Series('F3', index=index_tzaware, dtype=object)  # default F3
-    # Sabato (non festivo): F2 07–22
+
+    # Sabato (non festivo): F2 07–23 => ore 7..22
     sat_mask = (dow == 5) & (~is_holiday)
     bands.loc[sat_mask & hour.between(7, 22)] = 'F2'
+
     # Lun–Ven (non festivi)
     mf_mask = dow.between(0, 4) & (~is_holiday)
-    bands.loc[mf_mask & hour.between(8, 18)] = 'F1'
-    bands.loc[mf_mask & ((hour == 7) | hour.between(19, 22))] = 'F2'
-    # Domenica e festivi rimangono F3
+    bands.loc[mf_mask & hour.between(8, 18)] = 'F1'                 # 08–19 -> ore 8..18
+    bands.loc[mf_mask & ((hour == 7) | hour.between(19, 22))] = 'F2' # 07 e 19–23 -> ore 7 e 19..22
+
+    # Domenica e festivi: F3 (già default)
     return bands
 
 # -----------------------------------------------------------------------------
-# Helper caricamento CSV + normalizzazione colonne
+# Caricamento CSV: upload → file in repo → GitHub raw
 # -----------------------------------------------------------------------------
 DEFAULT_NAME = "combined_Feb2024_to_Jan2025_hourly_F123_withNetGrid_lower.csv"
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_PATH = BASE_DIR / DEFAULT_NAME
+REPO_DIR = Path(__file__).resolve().parent
+DEFAULT_PATH = REPO_DIR / DEFAULT_NAME
+
+# Sostituisci <utente>/<repo>/<branch> con i tuoi valori (es. branch = main)
+RAW_URL = (
+    "https://raw.githubusercontent.com/<utente>/<repo>/<branch>/"
+    + DEFAULT_NAME
+)
 
 @st.cache_data(show_spinner=True)
-def load_data(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # Timestamp → Europe/Rome (accetta stringhe con offset oppure naive/UTC)
-    # Forziamo come UTC e poi convertiamo a Europe/Rome (funziona anche se Datetime ha offset)
+def load_data_auto(uploaded_file=None) -> pd.DataFrame:
+    # 1) Priorità: file caricato dall’utente
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+    else:
+        # 2) File locale nella repo (in Streamlit Cloud i file del repo sono nel filesystem)
+        try:
+            df = pd.read_csv(DEFAULT_PATH)
+            st.caption(f"Fonte dati: file nella repo → {DEFAULT_NAME}")
+        except Exception:
+            # 3) Fallback: URL raw di GitHub (pandas può leggere direttamente l’URL)
+            st.caption("Fonte dati: GitHub raw (fallback)")
+            df = pd.read_csv(RAW_URL)
+
+    # Normalizzazione base
     df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True, errors="coerce").dt.tz_convert("Europe/Rome")
     df = df.dropna(subset=["Datetime"]).set_index("Datetime").sort_index()
 
-    # Allinea nomi colonne (Export, NetGrid)
+    # Allinea nomi colonne
     if "Export_KWh" not in df.columns and "Export_kWh" in df.columns:
         df = df.rename(columns={"Export_kWh": "Export_KWh"})
     if "NetGrid_KWh" not in df.columns and "NetGrid_kWh" in df.columns:
         df = df.rename(columns={"NetGrid_kWh": "NetGrid_KWh"})
-
-    # Se manca NetGrid_KWh lo ricostruiamo
     if "NetGrid_KWh" not in df.columns and {"Total", "Autocons_kWh"}.issubset(df.columns):
         df["NetGrid_KWh"] = (df["Total"] - df["Autocons_kWh"]).clip(lower=0)
-
-    # Se manca Band la calcoliamo
     if "Band" not in df.columns:
         df["Band"] = compute_arera_band(df.index)
 
     return df
 
 # -----------------------------------------------------------------------------
-# Funzione di simulazione batteria (carica solo da surplus FV)
+# Simulazione batteria (carica solo da surplus FV)
 # -----------------------------------------------------------------------------
 def simulate_battery(df,
                      capacity_kwh=5.0,
@@ -138,8 +153,7 @@ def simulate_battery(df,
     """
     Modello semplice a passi orari.
     df deve avere: 'Total', 'PV_kWh'
-    Ritorna df con colonne aggiuntive *_batt e con flussi post-batteria:
-      - Autocons_kWh_batt, NetGrid_KWh_batt, Export_KWh_batt, ecc.
+    Ritorna df con colonne *_batt (post-batteria).
     """
     out = df.copy()
     load = out["Total"].astype(float).values
@@ -154,7 +168,7 @@ def simulate_battery(df,
     pv_direct = np.zeros(n)          # FV usata direttamente
     pv_surplus = np.zeros(n)         # FV eccedente dopo uso diretto
     batt_charge_in = np.zeros(n)     # energia che FINISCE in batteria (dopo efficienza di carica)
-    batt_discharge_out = np.zeros(n) # energia dalla batteria ai carichi (già con efficienza di scarica)
+    batt_discharge_out = np.zeros(n) # energia dalla batteria ai carichi (lato AC, già con efficienza di scarica)
     import_grid = np.zeros(n)
     export_grid = np.zeros(n)
 
@@ -171,13 +185,11 @@ def simulate_battery(df,
 
         # 2) Carica batteria (solo da surplus FV)
         headroom = max(soc_max - soc_prev, 0.0)
-        charge_batt_side_max = min(headroom, p_discharge_kw)  # limite prudente: usa p_discharge_kw o p_charge_kw a scelta
-        charge_batt_side_max = min(headroom, p_charge_kw)     # (preferiamo esplicito: limite potenza di carica)
-
-        # energia lato batteria dopo efficienza
+        charge_batt_side_max = min(headroom, p_charge_kw)  # kWh in 1h (limite potenza di carica)
         charge_batt_side = min(charge_batt_side_max, pv_surplus[t] * eta_ch)
         batt_charge_in[t] = charge_batt_side
-        # consumo FV lato AC per caricare:
+
+        # FV lato AC consumata per caricare
         pv_used_for_charge_ac = charge_batt_side / eta_ch if eta_ch > 0 else 0.0
         pv_surplus[t] -= min(pv_surplus[t], pv_used_for_charge_ac)
 
@@ -191,7 +203,7 @@ def simulate_battery(df,
 
         soc_new = soc_tmp - discharge_batt_side
 
-        # 4) Rete
+        # 4) Rete ed export
         rem_after_batt = rem_load - batt_discharge_out[t]
         import_grid[t] = max(rem_after_batt, 0.0)
         export_grid[t] = max(pv_surplus[t], 0.0)
@@ -201,48 +213,39 @@ def simulate_battery(df,
 
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
-    out["Batt_Discharge_KWh"] = batt_discharge_out
+    out["Batt_Discharge_kWh"] = batt_discharge_out
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
     out["NetGrid_KWh_batt"] = import_grid
     out["Export_KWh_batt"] = export_grid
-    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_KWh"]
+    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_kWh"]
     return out
 
 # -----------------------------------------------------------------------------
-# Sidebar – selezione CSV e filtri
+# Sidebar – selezione CSV (upload) e parametri
 # -----------------------------------------------------------------------------
 st.sidebar.title("⚙️ Impostazioni")
+uploaded = st.sidebar.file_uploader("Carica un CSV…", type=["csv"])
 
-csv_file = None
-if DEFAULT_PATH.exists():
-    st.sidebar.write(f"CSV di default: **{DEFAULT_NAME}**")
-    use_default = st.sidebar.checkbox("Usa file di default", value=True)
-    if use_default:
-        csv_file = DEFAULT_PATH
-
-if not csv_file:
-    uploaded = st.sidebar.file_uploader("Carica un CSV…", type=["csv"])
-    if uploaded is not None:
-        tmp_path = Path(uploaded.name)
-        with open(tmp_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-        csv_file = tmp_path
-
-if csv_file is None or not csv_file.exists():
-    st.error("⚠️ Seleziona o carica il CSV per continuare.")
-    st.stop()
-
-# Caricamento
+# Caricamento dati con fallback
 try:
-    df = load_data(csv_file)
+    df = load_data_auto(uploaded_file=uploaded)
 except Exception as e:
     st.error(f"Errore nel caricamento del CSV: {e}")
     st.stop()
 
+if df.empty:
+    st.error("⚠️ Il DataFrame è vuoto.")
+    st.stop()
+
+# -----------------------------------------------------------------------------
 # Filtri
+# -----------------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.header("Filtri dati")
+
+if "Band" not in df.columns:
+    df["Band"] = compute_arera_band(df.index)
 
 bands = sorted(df["Band"].dropna().unique().tolist())
 selected_bands = st.sidebar.multiselect("Fasce ARERA:", bands, default=bands)
@@ -280,12 +283,11 @@ soc_init = st.sidebar.slider("SOC iniziale (%)", min_value=0, max_value=100, val
 # -----------------------------------------------------------------------------
 # Preparazione dati (FIX duplicati → resample orario → Band)
 # -----------------------------------------------------------------------------
-# Diagnostica duplicati (facoltativa)
 n_dup = int(df_filt.index.duplicated().sum())
 if n_dup > 0:
     st.info(f"🔧 Risolti {n_dup} duplicati orari nell'intervallo selezionato.")
 
-# 1) Collassa i duplicati sommando SOLO le colonne numeriche (kWh per ora)
+# 1) Collassa duplicati sommando SOLO le colonne numeriche (kWh/ora)
 num_cols = df_filt.select_dtypes(include="number").columns
 df_no_dups = (
     df_filt
@@ -294,7 +296,7 @@ df_no_dups = (
     .sum()
 )
 
-# 2) Griglia oraria continua (usa '1h' – niente FutureWarning)
+# 2) Griglia oraria continua (usa '1h' – nessun FutureWarning)
 df_hour = df_no_dups.resample("1h").sum(min_count=1)
 
 # 3) Ricalcola la fascia ARERA sull’indice nuovo (Europe/Rome)
@@ -357,7 +359,7 @@ st.divider()
 # -----------------------------------------------------------------------------
 # Grafico area giornaliero (Total vs PV)
 # -----------------------------------------------------------------------------
-st.subheader("Andamento giornaliero – Prelievo vs Produzione")
+st.subheader("Andamento giornaliero – Carichi vs Produzione FV")
 daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
 fig_daily = px.area(
     daily,
