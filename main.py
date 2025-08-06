@@ -65,10 +65,9 @@ def _italy_holidays(year: int) -> set:
 def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
     """
     Restituisce Serie 'Band' con F1/F2/F3 per indice Europe/Rome.
-    Regole:
       - Domenica e festivi: F3 tutto il giorno.
-      - Sabato: F2 07–23 (cioè ore 7..22), altrimenti F3.
-      - Lun–Ven (non festivi): F1 08–19 (cioè ore 8..18); F2 07 e 19–23 (ore 7 e 19..22); F3 resto.
+      - Sabato: F2 07–23 (ore 7..22).
+      - Lun–Ven (non festivi): F1 08–19 (ore 8..18); F2 07 e 19–23 (ore 7 e 19..22); F3 resto.
     """
     if index_tzaware.tz is None:
         raise ValueError("L'indice deve essere timezone-aware (Europe/Rome).")
@@ -82,17 +81,13 @@ def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
     is_holiday = pd.Series([ts.date() in hol for ts in index_tzaware], index=index_tzaware, dtype=bool)
 
     bands = pd.Series('F3', index=index_tzaware, dtype=object)  # default F3
-
-    # Sabato (non festivo): F2 07–23 => ore 7..22
+    # Sabato
     sat_mask = (dow == 5) & (~is_holiday)
     bands.loc[sat_mask & hour.between(7, 22)] = 'F2'
-
     # Lun–Ven (non festivi)
     mf_mask = dow.between(0, 4) & (~is_holiday)
-    bands.loc[mf_mask & hour.between(8, 18)] = 'F1'                 # 08–19 -> ore 8..18
-    bands.loc[mf_mask & ((hour == 7) | hour.between(19, 22))] = 'F2' # 07 e 19–23 -> ore 7 e 19..22
-
-    # Domenica e festivi: F3 (già default)
+    bands.loc[mf_mask & hour.between(8, 18)] = 'F1'
+    bands.loc[mf_mask & ((hour == 7) | hour.between(19, 22))] = 'F2'
     return bands
 
 # -----------------------------------------------------------------------------
@@ -102,7 +97,7 @@ DEFAULT_NAME = "combined_Feb2024_to_Jan2025_hourly_F123_withNetGrid_lower.csv"
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_PATH = REPO_DIR / DEFAULT_NAME
 
-# Sostituisci <utente>/<repo>/<branch> con i tuoi valori (es. branch = main)
+# Sostituisci <utente>/<repo>/<branch> (es. branch = main)
 RAW_URL = (
     "https://raw.githubusercontent.com/<utente>/<repo>/<branch>/"
     + DEFAULT_NAME
@@ -110,24 +105,23 @@ RAW_URL = (
 
 @st.cache_data(show_spinner=True)
 def load_data_auto(uploaded_file=None) -> pd.DataFrame:
-    # 1) Priorità: file caricato dall’utente
+    # 1) File caricato dall’utente
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
     else:
-        # 2) File locale nella repo (in Streamlit Cloud i file del repo sono nel filesystem)
+        # 2) File locale nella repo
         try:
             df = pd.read_csv(DEFAULT_PATH)
             st.caption(f"Fonte dati: file nella repo → {DEFAULT_NAME}")
         except Exception:
-            # 3) Fallback: URL raw di GitHub (pandas può leggere direttamente l’URL)
+            # 3) Fallback: URL raw GitHub
             st.caption("Fonte dati: GitHub raw (fallback)")
             df = pd.read_csv(RAW_URL)
 
-    # Normalizzazione base
+    # Normalizzazione
     df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True, errors="coerce").dt.tz_convert("Europe/Rome")
     df = df.dropna(subset=["Datetime"]).set_index("Datetime").sort_index()
 
-    # Allinea nomi colonne
     if "Export_KWh" not in df.columns and "Export_kWh" in df.columns:
         df = df.rename(columns={"Export_kWh": "Export_KWh"})
     if "NetGrid_KWh" not in df.columns and "NetGrid_kWh" in df.columns:
@@ -222,7 +216,7 @@ def simulate_battery(df,
     return out
 
 # -----------------------------------------------------------------------------
-# Sidebar – selezione CSV (upload) e parametri
+# Sidebar – upload e preset batteria
 # -----------------------------------------------------------------------------
 st.sidebar.title("⚙️ Impostazioni")
 uploaded = st.sidebar.file_uploader("Carica un CSV…", type=["csv"])
@@ -266,28 +260,42 @@ mask = (
 df_filt = df.loc[mask].copy()
 
 # -----------------------------------------------------------------------------
-# Simulazione batteria – controlli UI
+# Simulazione batteria – controlli UI (con preset)
 # -----------------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.header("🔋 Batteria (simulazione)")
 
-use_batt = st.sidebar.checkbox("Attiva batteria", value=False)
-cap = st.sidebar.number_input("Capacità (kWh)", min_value=0.0, value=5.0, step=0.5)
-p_ch = st.sidebar.number_input("Potenza carica (kW)", min_value=0.0, value=3.0, step=0.5)
-p_dis = st.sidebar.number_input("Potenza scarica (kW)", min_value=0.0, value=3.0, step=0.5)
-eta_ch = st.sidebar.slider("Efficienza carica ηch", min_value=0.80, max_value=1.00, value=0.95, step=0.01)
-eta_dis = st.sidebar.slider("Efficienza scarica ηdis", min_value=0.80, max_value=1.00, value=0.95, step=0.01)
-soc_min = st.sidebar.slider("SOC minimo (%)", min_value=0, max_value=50, value=5, step=1) / 100.0
-soc_init = st.sidebar.slider("SOC iniziale (%)", min_value=0, max_value=100, value=50, step=5) / 100.0
+PRESETS = {
+    "Residenziale 5 kWh": dict(cap=5.0,  p_ch=3.0, p_dis=3.0, eta_ch=0.95, eta_dis=0.95, soc_min=0.05, soc_init=0.50),
+    "Residenziale 10 kWh":dict(cap=10.0, p_ch=4.0, p_dis=4.0, eta_ch=0.96, eta_dis=0.96, soc_min=0.05, soc_init=0.50),
+    "PMI 15 kWh":         dict(cap=15.0, p_ch=5.0, p_dis=5.0, eta_ch=0.96, eta_dis=0.96, soc_min=0.07, soc_init=0.50),
+}
+
+with st.sidebar.expander("Preset batteria", expanded=False):
+    preset_name = st.selectbox("Scegli preset", list(PRESETS.keys()) + ["Personalizzato"])
+    if preset_name != "Personalizzato" and st.button("Applica preset", use_container_width=True):
+        for k, v in PRESETS[preset_name].items():
+            st.session_state[k] = v
+        st.experimental_rerun()
+
+use_batt = st.sidebar.checkbox("Attiva batteria", value=False, key="use_batt")
+
+cap     = st.sidebar.number_input("Capacità (kWh)",      min_value=0.0, value=st.session_state.get("cap", 5.0),  step=0.5, key="cap")
+p_ch    = st.sidebar.number_input("Potenza carica (kW)", min_value=0.0, value=st.session_state.get("p_ch", 3.0), step=0.5, key="p_ch")
+p_dis   = st.sidebar.number_input("Potenza scarica (kW)",min_value=0.0, value=st.session_state.get("p_dis",3.0), step=0.5, key="p_dis")
+eta_ch  = st.sidebar.slider("Efficienza carica ηch",  min_value=0.80, max_value=1.00, value=st.session_state.get("eta_ch",0.95), step=0.01, key="eta_ch")
+eta_dis = st.sidebar.slider("Efficienza scarica ηdis",min_value=0.80, max_value=1.00, value=st.session_state.get("eta_dis",0.95), step=0.01, key="eta_dis")
+soc_min = st.sidebar.slider("SOC minimo (%)", min_value=0, max_value=50, value=int(100*st.session_state.get("soc_min",0.05)), step=1, key="soc_min_pct") / 100.0
+soc_init= st.sidebar.slider("SOC iniziale (%)", min_value=0, max_value=100, value=int(100*st.session_state.get("soc_init",0.50)), step=5, key="soc_init_pct") / 100.0
 
 # -----------------------------------------------------------------------------
-# Preparazione dati (FIX duplicati → resample orario → Band)
+# Preparazione dati (fix duplicati → griglia oraria → Band)
 # -----------------------------------------------------------------------------
 n_dup = int(df_filt.index.duplicated().sum())
 if n_dup > 0:
     st.info(f"🔧 Risolti {n_dup} duplicati orari nell'intervallo selezionato.")
 
-# 1) Collassa duplicati sommando SOLO le colonne numeriche (kWh/ora)
+# 1) Collassa duplicati (somma solo colonne numeriche kWh/ora)
 num_cols = df_filt.select_dtypes(include="number").columns
 df_no_dups = (
     df_filt
@@ -296,18 +304,18 @@ df_no_dups = (
     .sum()
 )
 
-# 2) Griglia oraria continua (usa '1h' – nessun FutureWarning)
+# 2) Griglia oraria continua
 df_hour = df_no_dups.resample("1h").sum(min_count=1)
 
-# 3) Ricalcola la fascia ARERA sull’indice nuovo (Europe/Rome)
+# 3) Ricalcola Band sull’indice nuovo
 df_hour["Band"] = compute_arera_band(df_hour.index)
 
-# 4) Riempi eventuali buchi per la simulazione
+# 4) Riempi eventuali buchi
 for c in ["Total", "PV_kWh", "Autocons_kWh"]:
     if c in df_hour.columns:
         df_hour[c] = df_hour[c].fillna(0)
 
-# Export/NetGrid naming robusto (ricostruisce se mancano)
+# Export/NetGrid naming robusto
 export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_kWh" in df_hour.columns else None)
 if export_col is None:
     df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
@@ -343,7 +351,7 @@ else:
     df_use   = df_hour
 
 # -----------------------------------------------------------------------------
-# KPI
+# KPI principali
 # -----------------------------------------------------------------------------
 st.subheader("KPI")
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -354,10 +362,30 @@ col4.metric("Export (kWh)", f"{df_use[EXPORT].sum():,.0f}")
 autonomy = (df_use[AUTOCONS].sum() / df_use["Total"].sum() * 100) if df_use["Total"].sum() else 0
 col5.metric("Autonomia (%)", f"{autonomy:.1f}%")
 
+# -----------------------------------------------------------------------------
+# KPI "Contributo batteria" (vs baseline senza batteria)
+# -----------------------------------------------------------------------------
+baseline = df_hour.copy()
+if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_kWh"}.issubset(baseline.columns):
+    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_kWh"]).clip(lower=0)
+
+prelievo_baseline = baseline["NetGrid_KWh"].sum() if "NetGrid_KWh" in baseline.columns else 0.0
+autocons_baseline = baseline["Autocons_kWh"].sum() if "Autocons_kWh" in baseline.columns else 0.0
+
+prelievo_scenario = df_use["NetGrid_KWh_batt"].sum() if use_batt else prelievo_baseline
+autocons_scenario = df_use[AUTOCONS].sum()
+
+kwh_prelievo_ev = prelievo_baseline - prelievo_scenario
+kwh_autocons_add = autocons_scenario - autocons_baseline
+
+c1, c2 = st.columns(2)
+c1.metric("Prelievo evitato (kWh)", f"{kwh_prelievo_ev:,.0f}")
+c2.metric("Autoconsumo FV aggiuntivo (kWh)", f"{kwh_autocons_add:,.0f}")
+
 st.divider()
 
 # -----------------------------------------------------------------------------
-# Grafico area giornaliero (Total vs PV)
+# Grafico area giornaliero (Carichi vs Produzione FV)
 # -----------------------------------------------------------------------------
 st.subheader("Andamento giornaliero – Carichi vs Produzione FV")
 daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
@@ -369,6 +397,18 @@ fig_daily = px.area(
 )
 fig_daily.update_layout(legend_orientation="h", legend_y=-0.2)
 st.plotly_chart(fig_daily, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# Grafico SOC batteria
+# -----------------------------------------------------------------------------
+if use_batt and "Batt_SOC_kWh" in df_use.columns:
+    st.subheader("Andamento SOC batteria")
+    fig_soc = px.line(
+        df_use[["Batt_SOC_kWh"]],  # mostra ora per ora; se vuoi media giornaliera: .resample("D").mean()
+        y="Batt_SOC_kWh",
+        labels={"Batt_SOC_kWh": "SOC (kWh)", "index": "Data/Ora"},
+    )
+    st.plotly_chart(fig_soc, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # Grafico barre impilate mensili (scenario attivo)
