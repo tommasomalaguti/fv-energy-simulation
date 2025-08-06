@@ -47,22 +47,28 @@ def _easter_sunday(year: int) -> pd.Timestamp:
 
 def _italy_holidays(year: int) -> set:
     fixed = [
-        pd.Timestamp(year, 1, 1),
-        pd.Timestamp(year, 1, 6),
-        pd.Timestamp(year, 4, 25),
-        pd.Timestamp(year, 5, 1),
-        pd.Timestamp(year, 6, 2),
-        pd.Timestamp(year, 8, 15),
-        pd.Timestamp(year, 11, 1),
-        pd.Timestamp(year, 12, 8),
-        pd.Timestamp(year, 12, 25),
-        pd.Timestamp(year, 12, 26),
+        pd.Timestamp(year, 1, 1),   # Capodanno
+        pd.Timestamp(year, 1, 6),   # Epifania
+        pd.Timestamp(year, 4, 25),  # Liberazione
+        pd.Timestamp(year, 5, 1),   # Lavoro
+        pd.Timestamp(year, 6, 2),   # Repubblica
+        pd.Timestamp(year, 8, 15),  # Ferragosto
+        pd.Timestamp(year, 11, 1),  # Tutti i Santi
+        pd.Timestamp(year, 12, 8),  # Immacolata
+        pd.Timestamp(year, 12, 25), # Natale
+        pd.Timestamp(year, 12, 26), # Santo Stefano
     ]
     easter = _easter_sunday(year)
     easter_monday = easter + pd.Timedelta(days=1)
     return set(d.date() for d in fixed + [easter_monday])
 
 def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
+    """
+    Restituisce Serie 'Band' con F1/F2/F3 per indice Europe/Rome.
+      - Domenica e festivi: F3 tutto il giorno.
+      - Sabato: F2 07–23 (ore 7..22).
+      - Lun–Ven (non festivi): F1 08–19 (ore 8..18); F2 07 e 19–23 (ore 7 e 19..22); F3 resto.
+    """
     if index_tzaware.tz is None:
         raise ValueError("L'indice deve essere timezone-aware (Europe/Rome).")
     years = sorted(set(index_tzaware.year))
@@ -74,9 +80,11 @@ def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
     hour = pd.Series(index_tzaware.hour, index=index_tzaware)
     is_holiday = pd.Series([ts.date() in hol for ts in index_tzaware], index=index_tzaware, dtype=bool)
 
-    bands = pd.Series('F3', index=index_tzaware, dtype=object)
+    bands = pd.Series('F3', index=index_tzaware, dtype=object)  # default F3
+    # Sabato
     sat_mask = (dow == 5) & (~is_holiday)
     bands.loc[sat_mask & hour.between(7, 22)] = 'F2'
+    # Lun–Ven (non festivi)
     mf_mask = dow.between(0, 4) & (~is_holiday)
     bands.loc[mf_mask & hour.between(8, 18)] = 'F1'
     bands.loc[mf_mask & ((hour == 7) | hour.between(19, 22))] = 'F2'
@@ -88,22 +96,29 @@ def compute_arera_band(index_tzaware: pd.DatetimeIndex) -> pd.Series:
 DEFAULT_NAME = "combined_Feb2024_to_Jan2025_hourly_F123_withNetGrid_lower.csv"
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_PATH = REPO_DIR / DEFAULT_NAME
+
+# Sostituisci <utente>/<repo>/<branch> (es. branch = main)
 RAW_URL = (
-    "https://raw.githubusercontent.com/<utente>/<repo>/<branch>/" + DEFAULT_NAME
+    "https://raw.githubusercontent.com/tommasomalaguti/fv-energy-simulation/refs/heads/main/main.py"
+    + DEFAULT_NAME
 )
 
 @st.cache_data(show_spinner=True)
 def load_data_auto(uploaded_file=None) -> pd.DataFrame:
+    # 1) File caricato dall’utente
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
     else:
+        # 2) File locale nella repo
         try:
             df = pd.read_csv(DEFAULT_PATH)
             st.caption(f"Fonte dati: file nella repo → {DEFAULT_NAME}")
         except Exception:
+            # 3) Fallback: URL raw GitHub
             st.caption("Fonte dati: GitHub raw (fallback)")
             df = pd.read_csv(RAW_URL)
 
+    # Normalizzazione
     df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True, errors="coerce").dt.tz_convert("Europe/Rome")
     df = df.dropna(subset=["Datetime"]).set_index("Datetime").sort_index()
 
@@ -129,6 +144,11 @@ def simulate_battery(df,
                      eta_dis=0.95,
                      soc_min_frac=0.05,
                      soc_init_frac=0.50):
+    """
+    Modello semplice a passi orari.
+    df deve avere: 'Total', 'PV_kWh'
+    Ritorna df con colonne *_batt (post-batteria).
+    """
     out = df.copy()
     load = out["Total"].astype(float).values
     pv   = out["PV_kWh"].astype(float).values
@@ -139,10 +159,10 @@ def simulate_battery(df,
     soc_min = soc_min_frac * capacity_kwh
     soc0    = soc_init_frac * capacity_kwh
 
-    pv_direct = np.zeros(n)
-    pv_surplus = np.zeros(n)
-    batt_charge_in = np.zeros(n)
-    batt_discharge_out = np.zeros(n)
+    pv_direct = np.zeros(n)          # FV usata direttamente
+    pv_surplus = np.zeros(n)         # FV eccedente dopo uso diretto
+    batt_charge_in = np.zeros(n)     # energia che FINISCE in batteria (dopo efficienza di carica)
+    batt_discharge_out = np.zeros(n) # energia dalla batteria ai carichi (lato AC, già con efficienza di scarica)
     import_grid = np.zeros(n)
     export_grid = np.zeros(n)
 
@@ -152,20 +172,24 @@ def simulate_battery(df,
         L = max(load[t], 0.0)
         E = max(pv[t], 0.0)
 
+        # 1) FV → carichi
         pv_direct[t] = min(L, E)
         rem_load = L - pv_direct[t]
         pv_surplus[t] = E - pv_direct[t]
 
+        # 2) Carica batteria (solo da surplus FV)
         headroom = max(soc_max - soc_prev, 0.0)
-        charge_batt_side_max = min(headroom, p_charge_kw)
+        charge_batt_side_max = min(headroom, p_charge_kw)  # kWh in 1h (limite potenza di carica)
         charge_batt_side = min(charge_batt_side_max, pv_surplus[t] * eta_ch)
         batt_charge_in[t] = charge_batt_side
 
+        # FV lato AC consumata per caricare
         pv_used_for_charge_ac = charge_batt_side / eta_ch if eta_ch > 0 else 0.0
         pv_surplus[t] -= min(pv_surplus[t], pv_used_for_charge_ac)
 
         soc_tmp = soc_prev + batt_charge_in[t]
 
+        # 3) Scarica per coprire carico residuo
         available_batt_side = max(soc_tmp - soc_min, 0.0)
         deliverable_ac = min(rem_load, available_batt_side * eta_dis, p_discharge_kw * eta_dis)
         discharge_batt_side = deliverable_ac / eta_dis if eta_dis > 0 else 0.0
@@ -173,6 +197,7 @@ def simulate_battery(df,
 
         soc_new = soc_tmp - discharge_batt_side
 
+        # 4) Rete ed export
         rem_after_batt = rem_load - batt_discharge_out[t]
         import_grid[t] = max(rem_after_batt, 0.0)
         export_grid[t] = max(pv_surplus[t], 0.0)
@@ -182,12 +207,12 @@ def simulate_battery(df,
 
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
-    out["Batt_Discharge_kWh"] = batt_discharge_out
+    out["Batt_Discharge_kWh"] = batt_discharge_out  # <-- nome coerente (kWh con h minuscola)
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
     out["NetGrid_KWh_batt"] = import_grid
     out["Export_KWh_batt"] = export_grid
-    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_KWh"]
+    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_kWh"]
     return out
 
 # -----------------------------------------------------------------------------
@@ -220,7 +245,10 @@ selected_bands = st.sidebar.multiselect("Fasce ARERA:", bands, default=bands)
 
 min_date, max_date = df.index.min().date(), df.index.max().date()
 start_date, end_date = st.sidebar.date_input(
-    "Intervallo date:", value=(min_date, max_date), min_value=min_date, max_value=max_date
+    "Intervallo date:",
+    value=(min_date, max_date),
+    min_value=min_date,
+    max_value=max_date
 )
 
 mask = (
@@ -264,16 +292,28 @@ n_dup = int(df_filt.index.duplicated().sum())
 if n_dup > 0:
     st.info(f"🔧 Risolti {n_dup} duplicati orari nell'intervallo selezionato.")
 
+# 1) Collassa duplicati (somma solo colonne numeriche kWh/ora)
 num_cols = df_filt.select_dtypes(include="number").columns
-df_no_dups = df_filt.sort_index().groupby(level=0)[num_cols].sum()
+df_no_dups = (
+    df_filt
+    .sort_index()
+    .groupby(level=0)[num_cols]
+    .sum()
+)
+
+# 2) Griglia oraria continua
 df_hour = df_no_dups.resample("1h").sum(min_count=1)
+
+# 3) Ricalcola Band sull’indice nuovo
 df_hour["Band"] = compute_arera_band(df_hour.index)
 
+# 4) Riempi eventuali buchi
 for c in ["Total", "PV_kWh", "Autocons_kWh"]:
     if c in df_hour.columns:
         df_hour[c] = df_hour[c].fillna(0)
 
-export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_kWh" in df_hour.columns else None)
+# Export/NetGrid naming robusto
+export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
 if export_col is None:
     df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
     export_col = "Export_KWh"
@@ -306,6 +346,10 @@ else:
     NET      = net_col
     EXPORT   = export_col
     df_use   = df_hour
+
+# Salvagente: normalizza eventuale variante maiuscola
+if "Batt_Discharge_KWh" in df_use.columns and "Batt_Discharge_kWh" not in df_use.columns:
+    df_use = df_use.rename(columns={"Batt_Discharge_KWh": "Batt_Discharge_kWh"})
 
 # -----------------------------------------------------------------------------
 # KPI principali
@@ -346,7 +390,12 @@ st.divider()
 # -----------------------------------------------------------------------------
 st.subheader("Andamento giornaliero – Carichi vs Produzione FV")
 daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
-fig_daily = px.area(daily, x=daily.index, y=["Total", "PV_kWh"], labels={"value": "kWh al giorno", "variable": ""})
+fig_daily = px.area(
+    daily,
+    x=daily.index,
+    y=["Total", "PV_kWh"],
+    labels={"value": "kWh al giorno", "variable": ""},
+)
 fig_daily.update_layout(legend_orientation="h", legend_y=-0.2)
 st.plotly_chart(fig_daily, use_container_width=True)
 
@@ -355,7 +404,11 @@ st.plotly_chart(fig_daily, use_container_width=True)
 # -----------------------------------------------------------------------------
 if use_batt and "Batt_SOC_kWh" in df_use.columns:
     st.subheader("Andamento SOC batteria")
-    fig_soc = px.line(df_use[["Batt_SOC_kWh"]], y="Batt_SOC_kWh", labels={"Batt_SOC_kWh": "SOC (kWh)", "index": "Data/Ora"})
+    fig_soc = px.line(
+        df_use[["Batt_SOC_kWh"]],
+        y="Batt_SOC_kWh",
+        labels={"Batt_SOC_kWh": "SOC (kWh)", "index": "Data/Ora"},
+    )
     st.plotly_chart(fig_soc, use_container_width=True)
 
 # -----------------------------------------------------------------------------
@@ -375,15 +428,22 @@ st.plotly_chart(fig_month, use_container_width=True)
 # -----------------------------------------------------------------------------
 st.subheader("Heat-map autoconsumo (ora × settimana ISO)")
 week_series = df_use.index.isocalendar().week
-pivot = df_use.assign(week=week_series).pivot_table(index=df_use.index.hour, columns="week", values=AUTOCONS, aggfunc="sum")
-fig_heat = px.imshow(pivot, labels=dict(x="Settimana ISO", y="Ora", color="kWh autocons"), aspect="auto")
+pivot = (
+    df_use.assign(week=week_series)
+          .pivot_table(index=df_use.index.hour, columns="week", values=AUTOCONS, aggfunc="sum")
+)
+fig_heat = px.imshow(
+    pivot,
+    labels=dict(x="Settimana ISO", y="Ora", color="kWh autocons"),
+    aspect="auto",
+)
 fig_heat.update_yaxes(dtick=1)
 st.plotly_chart(fig_heat, use_container_width=True)
 
 st.divider()
 
 # =============================================================================
-# 💶 BLOCCO ECONOMICO
+# 💶 BLOCCO ECONOMICO (fix formato €)
 # =============================================================================
 st.sidebar.header("💶 Tariffe")
 price_f1 = st.sidebar.number_input("Prezzo F1 (€/kWh)", min_value=0.0, value=0.30, step=0.01, format="%.3f")
@@ -394,7 +454,15 @@ use_export_credit = st.sidebar.checkbox("Considera credito export", value=True)
 st.sidebar.caption("Nota: stima semplificata. Quote fisse, potenza impegnata, oneri/IVA non inclusi.")
 
 def _fmt_eur(x: float) -> str:
-    return f"€ {x:,.0f}".replace(",", " ").replace(".", ",").replace(" ", ".")
+    """
+    Formatta importi in stile italiano: '€ 1.234,56'
+    (fix del bug che mostrava '€.597')
+    """
+    s = f"{x:,.2f}"           # es. 1,234,567.89
+    s = s.replace(",", "X")   # swap separatori
+    s = s.replace(".", ",")   # -> 1,234,567,89 (provvisorio)
+    s = s.replace("X", ".")   # -> 1.234.567,89
+    return f"€ {s}"
 
 def compute_costs(df_in: pd.DataFrame, import_col: str, export_col: str):
     if "Band" not in df_in.columns:
