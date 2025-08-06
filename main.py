@@ -212,7 +212,7 @@ def simulate_battery(df,
     out["PV_Surplus_KWh"] = pv_surplus
     out["NetGrid_KWh_batt"] = import_grid
     out["Export_KWh_batt"] = export_grid
-    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_kWh"]
+    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_KWh"]
     return out
 
 # -----------------------------------------------------------------------------
@@ -313,7 +313,7 @@ for c in ["Total", "PV_kWh", "Autocons_kWh"]:
         df_hour[c] = df_hour[c].fillna(0)
 
 # Export/NetGrid naming robusto
-export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
+export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_kWh" in df_hour.columns else None)
 if export_col is None:
     df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
     export_col = "Export_KWh"
@@ -530,6 +530,176 @@ st.download_button(
     file_name="riepilogo_economico_mensile.csv",
     mime="text/csv",
 )
+
+# =============================================================================
+# 📈 RIENTRO INVESTIMENTO (ROI / Payback / NPV / IRR)
+# =============================================================================
+st.divider()
+st.subheader("📈 Rientro investimento")
+
+# --- Parametri finanziari (sidebar) ---
+st.sidebar.header("💸 Parametri investimento")
+eval_mode = st.sidebar.selectbox(
+    "Valutazione investimento",
+    ["PV + Batteria vs Solo Rete", "Solo Batteria vs PV esistente"]
+)
+capex_pv = st.sidebar.number_input("CAPEX FV (€)", min_value=0, value=7000, step=100)
+capex_batt = st.sidebar.number_input("CAPEX Batteria (€)", min_value=0, value=4000, step=100)
+om_pct = st.sidebar.number_input("O&M annuo (% CAPEX considerato)", min_value=0.0, max_value=10.0, value=1.0, step=0.1) / 100.0
+
+# Incentivo semplice: % del CAPEX, ripartito su 'incent_years' anni (es. detrazione)
+incent_pct = st.sidebar.number_input("Incentivo % su CAPEX (rateizzato)", min_value=0.0, max_value=100.0, value=0.0, step=1.0) / 100.0
+incent_years = st.sidebar.number_input("Anni incentivo", min_value=1, max_value=20, value=10, step=1)
+
+# Sostituzione batteria (opzionale)
+batt_repl_year = st.sidebar.number_input("Sostituzione batteria (anno, 0=mai)", min_value=0, max_value=30, value=0, step=1)
+batt_repl_cost = st.sidebar.number_input("Costo sostituzione batteria (€)", min_value=0, max_value=50000, value=0, step=100)
+
+# Proiezione
+years = st.sidebar.number_input("Orizzonte (anni)", min_value=1, max_value=30, value=20, step=1)
+disc = st.sidebar.number_input("Tasso di sconto %", min_value=0.0, max_value=20.0, value=5.0, step=0.5) / 100.0
+esc = st.sidebar.number_input("Crescita prezzo energia % (annua)", min_value=0.0, max_value=30.0, value=0.0, step=0.5) / 100.0
+salvage_pct = st.sidebar.number_input("Valore residuo a fine vita (% CAPEX considerato)", min_value=0.0, max_value=100.0, value=0.0, step=1.0) / 100.0
+
+# --- Risparmio annuo base dal blocco economico ---
+# net_b = costo netto baseline (PV senza batteria)
+# net_s = costo netto scenario (con batteria se attiva; altrimenti = baseline)
+# net_all = costo se tutta l'energia fosse da rete (nessun FV)
+if eval_mode == "PV + Batteria vs Solo Rete":
+    # risparmio rispetto a nessun impianto
+    saving0 = max(net_all - net_s, 0.0)
+    capex_considered = capex_pv + capex_batt
+else:
+    # risparmio della sola batteria rispetto a PV senza batteria
+    saving0 = max(net_b - net_s, 0.0)
+    capex_considered = capex_batt
+
+# O&M annuo come % del CAPEX considerato
+om_year = om_pct * capex_considered
+
+# Incentivo: quota annua costante nei primi 'incent_years' anni
+incent_annual = capex_considered * incent_pct / max(incent_years, 1)
+
+# --- Costruzione dei flussi di cassa annuali ---
+initial_cf = -capex_considered
+years_idx = np.arange(1, years + 1, 1)
+
+cash_year = []
+cash_year_disc = []
+parts = {"saving": [], "incent": [], "om": [], "repl": []}
+cum = []
+cum_disc = []
+
+def _npv(rate, cfs):
+    return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cfs))
+
+def _irr(cfs, lo=-0.99, hi=1.5, tol=1e-6, it=200):
+    # semplice bisezione sull'NPV
+    def f(r): return _npv(r, cfs)
+    a, b = lo, hi
+    fa, fb = f(a), f(b)
+    if fa * fb > 0:
+        return None
+    for _ in range(it):
+        m = (a + b) / 2
+        fm = f(m)
+        if abs(fm) < tol:
+            return m
+        if fa * fm <= 0:
+            b, fb = m, fm
+        else:
+            a, fa = m, fm
+    return (a + b) / 2
+
+cum_val = initial_cf
+cum_disc_val = initial_cf
+
+for t in years_idx:
+    # risparmio dell'anno t con escalation
+    saving_t = saving0 * ((1 + esc) ** (t - 1))
+    # incentivo (se previsto)
+    incent_t = incent_annual if t <= incentiv_years else 0.0  # <-- ATTENZIONE: correggiamo il nome variabile sotto
+    # O&M
+    om_t = om_year
+    # sostituzione batteria nell'anno indicato
+    repl_t = (-batt_repl_cost) if (batt_repl_year > 0 and t == batt_repl_year) else 0.0
+    # valore residuo solo nell'ultimo anno
+    salvage_t = salvage_pct * capex_considered if t == years else 0.0
+
+    # correggiamo nome variabile incentivo
+    incent_t = incent_annual if t <= incent_years else 0.0
+
+    cf_t = saving_t + incent_t - om_t + repl_t + salvage_t
+
+    parts["saving"].append(saving_t)
+    parts["incent"].append(incent_t)
+    parts["om"].append(-om_t)
+    parts["repl"].append(repl_t)
+
+    cash_year.append(cf_t)
+    cash_year_disc.append(cf_t / ((1 + disc) ** t))
+
+    cum_val += cf_t
+    cum_disc_val += cf_t / ((1 + disc) ** t)
+    cum.append(cum_val)
+    cum_disc.append(cum_disc_val)
+
+# NPV / IRR / Payback
+npv_val = sum(cash_year_disc) + initial_cf
+irr_val = _irr([initial_cf] + cash_year)
+
+# Payback semplice (non scontato)
+try:
+    cum_simple = np.cumsum([initial_cf] + cash_year)
+    # primo anno in cui il cumulato diventa ≥ 0 (ignora l'indice 0 che è l'anno 0)
+    simple_pb = next(i for i in range(1, len(cum_simple)) if cum_simple[i] >= 0)
+except StopIteration:
+    simple_pb = None
+
+# Payback scontato
+try:
+    cum_disc_series = np.cumsum([initial_cf] + cash_year_disc)
+    disc_pb = next(i for i in range(1, len(cum_disc_series)) if cum_disc_series[i] >= 0)
+except StopIteration:
+    disc_pb = None
+
+# --- KPI rientro investimento ---
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("NPV (valore attuale netto)", _fmt_eur(npv_val))
+k2.metric("IRR (tasso interno di rendimento)", f"{irr_val*100:.1f}%" if irr_val is not None else "n/d")
+k3.metric("Payback semplice", f"{simple_pb} anni" if simple_pb else "n/d")
+k4.metric("Payback scontato", f"{disc_pb} anni" if disc_pb else "n/d")
+
+# Tabella dettaglio
+roi_df = pd.DataFrame({
+    "Anno": years_idx,
+    "Risparmio €": parts["saving"],
+    "Incentivi €": parts["incent"],
+    "O&M €": parts["om"],
+    "Sostituzioni €": parts["repl"],
+    "Flusso netto €": cash_year,
+    "Cum €": cum,
+    "Cum scontato €": cum_disc,
+})
+st.dataframe(roi_df.style.format({
+    "Risparmio €": _fmt_eur, "Incentivi €": _fmt_eur, "O&M €": _fmt_eur,
+    "Sostituzioni €": _fmt_eur, "Flusso netto €": _fmt_eur,
+    "Cum €": _fmt_eur, "Cum scontato €": _fmt_eur,
+}), use_container_width=True)
+
+st.download_button(
+    "💾 Scarica cashflow ROI (CSV)",
+    data=roi_df.to_csv(index=False).encode(),
+    file_name="roi_cashflow.csv",
+    mime="text/csv",
+)
+
+# Grafico: cumulato scontato
+fig_roi = go.Figure()
+fig_roi.add_scatter(x=years_idx, y=cum_disc, mode="lines+markers", name="Cum scontato")
+fig_roi.add_hline(y=0, line_dash="dot")
+fig_roi.update_layout(title="Cumulato scontato vs anni", xaxis_title="Anno", yaxis_title="€")
+st.plotly_chart(fig_roi, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # Tabella dati + download CSV scenario corrente
