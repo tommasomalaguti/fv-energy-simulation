@@ -97,9 +97,9 @@ DEFAULT_NAME = "combined_Feb2024_to_Jan2025_hourly_F123_withNetGrid_lower.csv"
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_PATH = REPO_DIR / DEFAULT_NAME
 
-# Sostituisci <utente>/<repo>/<branch> (es. branch = main)
+# URL raw corretto al CSV nella repo GitHub (modifica se il file non è in root)
 RAW_URL = (
-    "https://raw.githubusercontent.com/tommasomalaguti/fv-energy-simulation/refs/heads/main/main.py"
+    "https://raw.githubusercontent.com/tommasomalaguti/fv-energy-simulation/main/"
     + DEFAULT_NAME
 )
 
@@ -207,7 +207,7 @@ def simulate_battery(df,
 
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
-    out["Batt_Discharge_kWh"] = batt_discharge_out  # <-- nome coerente (kWh con h minuscola)
+    out["Batt_Discharge_kWh"] = batt_discharge_out  # nome coerente
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
     out["NetGrid_KWh_batt"] = import_grid
@@ -443,7 +443,7 @@ st.plotly_chart(fig_heat, use_container_width=True)
 st.divider()
 
 # =============================================================================
-# 💶 BLOCCO ECONOMICO (fix formato €)
+# 💶 BLOCCO ECONOMICO (con fix formato € e KPI "solo rete")
 # =============================================================================
 st.sidebar.header("💶 Tariffe")
 price_f1 = st.sidebar.number_input("Prezzo F1 (€/kWh)", min_value=0.0, value=0.30, step=0.01, format="%.3f")
@@ -454,10 +454,7 @@ use_export_credit = st.sidebar.checkbox("Considera credito export", value=True)
 st.sidebar.caption("Nota: stima semplificata. Quote fisse, potenza impegnata, oneri/IVA non inclusi.")
 
 def _fmt_eur(x: float) -> str:
-    """
-    Formatta importi in stile italiano: '€ 1.234,56'
-    (fix del bug che mostrava '€.597')
-    """
+    """Formatta importi stile italiano: '€ 1.234,56' (fix del bug '€.597')."""
     s = f"{x:,.2f}"           # es. 1,234,567.89
     s = s.replace(",", "X")   # swap separatori
     s = s.replace(".", ",")   # -> 1,234,567,89 (provvisorio)
@@ -498,12 +495,19 @@ imp_s, rev_s, net_s, mon_s = compute_costs(
     "Export_KWh_batt"  if use_batt else "Export_KWh",
 )
 
-# KPI economici
+# KPI economici principali
 st.subheader("KPI economici")
 e1, e2, e3 = st.columns(3)
 e1.metric("Spesa baseline (€/anno)", _fmt_eur(net_b))
 e2.metric("Spesa scenario (€/anno)", _fmt_eur(net_s))
 e3.metric("Risparmio (€/anno)", _fmt_eur(net_b - net_s))
+
+# 🔹 KPI aggiuntivo: costo se tutta l'energia fosse prelevata dalla rete (no FV)
+all_grid_df = df_hour.copy()
+all_grid_df["Import_ALLGRID"] = all_grid_df["Total"]
+all_grid_df["Export_ALLGRID"] = 0.0
+_, _, net_all, _ = compute_costs(all_grid_df, "Import_ALLGRID", "Export_ALLGRID")
+st.caption(f"Costo se tutta l'energia fosse prelevata dalla rete (no FV): {_fmt_eur(net_all)}")
 
 # Grafico economico mensile
 econ = pd.DataFrame({
