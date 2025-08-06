@@ -179,7 +179,7 @@ def simulate_battery(df,
 
         # 2) Carica batteria (solo da surplus FV)
         headroom = max(soc_max - soc_prev, 0.0)
-        charge_batt_side_max = min(headroom, p_charge_kw)  # kWh in 1h (limite potenza di carica)
+        charge_batt_side_max = min(headroom, p_charge_kw)  # kWh in 1h
         charge_batt_side = min(charge_batt_side_max, pv_surplus[t] * eta_ch)
         batt_charge_in[t] = charge_batt_side
 
@@ -205,14 +205,18 @@ def simulate_battery(df,
         soc[t] = np.clip(soc_new, soc_min, soc_max)
         soc_prev = soc[t]
 
+    # Usiamo il nome CANONICO 'Batt_Discharge_kWh' (h minuscola).
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
-    out["Batt_Discharge_kWh"] = batt_discharge_out  # nome coerente
+    out["Batt_Discharge_kWh"] = batt_discharge_out
+    # Alias compatibilità: crea anche 'Batt_Discharge_KWh' (H maiuscola)
+    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]
+
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
     out["NetGrid_KWh_batt"] = import_grid
     out["Export_KWh_batt"] = export_grid
-    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_KWh"]
+    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_kWh"]
     return out
 
 # -----------------------------------------------------------------------------
@@ -313,7 +317,7 @@ for c in ["Total", "PV_kWh", "Autocons_kWh"]:
         df_hour[c] = df_hour[c].fillna(0)
 
 # Export/NetGrid naming robusto
-export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_kWh" in df_hour.columns else None)
+export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
 if export_col is None:
     df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
     export_col = "Export_KWh"
@@ -347,9 +351,11 @@ else:
     EXPORT   = export_col
     df_use   = df_hour
 
-# Salvagente: normalizza eventuale variante maiuscola
+# Normalizza/alias nomi batteria per evitare KeyError a valle
+if "Batt_Discharge_kWh" in df_use.columns and "Batt_Discharge_KWh" not in df_use.columns:
+    df_use["Batt_Discharge_KWh"] = df_use["Batt_Discharge_kWh"]
 if "Batt_Discharge_KWh" in df_use.columns and "Batt_Discharge_kWh" not in df_use.columns:
-    df_use = df_use.rename(columns={"Batt_Discharge_KWh": "Batt_Discharge_kWh"})
+    df_use["Batt_Discharge_kWh"] = df_use["Batt_Discharge_KWh"]
 
 # -----------------------------------------------------------------------------
 # KPI principali
@@ -454,10 +460,10 @@ use_export_credit = st.sidebar.checkbox("Considera credito export", value=True)
 st.sidebar.caption("Nota: stima semplificata. Quote fisse, potenza impegnata, oneri/IVA non inclusi.")
 
 def _fmt_eur(x: float) -> str:
-    """Formatta importi stile italiano: '€ 1.234,56' (fix del bug '€.597')."""
+    """Formatta importi stile italiano: '€ 1.234,56'."""
     s = f"{x:,.2f}"           # es. 1,234,567.89
     s = s.replace(",", "X")   # swap separatori
-    s = s.replace(".", ",")   # -> 1,234,567,89 (provvisorio)
+    s = s.replace(".", ",")   # -> 1,234,567,89
     s = s.replace("X", ".")   # -> 1.234.567,89
     return f"€ {s}"
 
@@ -615,19 +621,16 @@ cum_val = initial_cf
 cum_disc_val = initial_cf
 
 for t in years_idx:
-    # risparmio dell'anno t con escalation
+    # risparmio con escalation
     saving_t = saving0 * ((1 + esc) ** (t - 1))
     # incentivo (se previsto)
-    incent_t = incent_annual if t <= incentiv_years else 0.0  # <-- ATTENZIONE: correggiamo il nome variabile sotto
+    incent_t = incent_annual if t <= incent_years else 0.0
     # O&M
     om_t = om_year
     # sostituzione batteria nell'anno indicato
     repl_t = (-batt_repl_cost) if (batt_repl_year > 0 and t == batt_repl_year) else 0.0
     # valore residuo solo nell'ultimo anno
     salvage_t = salvage_pct * capex_considered if t == years else 0.0
-
-    # correggiamo nome variabile incentivo
-    incent_t = incent_annual if t <= incent_years else 0.0
 
     cf_t = saving_t + incent_t - om_t + repl_t + salvage_t
 
@@ -651,7 +654,6 @@ irr_val = _irr([initial_cf] + cash_year)
 # Payback semplice (non scontato)
 try:
     cum_simple = np.cumsum([initial_cf] + cash_year)
-    # primo anno in cui il cumulato diventa ≥ 0 (ignora l'indice 0 che è l'anno 0)
     simple_pb = next(i for i in range(1, len(cum_simple)) if cum_simple[i] >= 0)
 except StopIteration:
     simple_pb = None
