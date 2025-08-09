@@ -552,7 +552,6 @@ if use_ev:
     p_chg    = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
 
     # Routine: fino a 2 slot "via" per giorno + km/slot
-    DAYS: List[str] = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
     slots_cfg = {d: [] for d in DAYS}
     km_per_slot = {d: [] for d in DAYS}
 
@@ -617,12 +616,12 @@ df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lowe
 df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
 
 # Export/NetGrid naming robusto
-export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
+export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_kWh" in df_hour.columns else None)
 if export_col is None:
     df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
     export_col = "Export_KWh"
 
-net_col = "NetGrid_KWh" if "NetGrid_KWh" in df_hour.columns else ("NetGrid_kWh" if "NetGrid_KWh" in df_hour.columns else None)
+net_col = "NetGrid_KWh" if "NetGrid_KWh" in df_hour.columns else ("NetGrid_kWh" if "NetGrid_kWh" in df_hour.columns else None)
 if net_col is None and {"Total","Autocons_kWh"}.issubset(df_hour.columns):
     df_hour["NetGrid_KWh"] = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
     net_col = "NetGrid_KWh"
@@ -655,7 +654,7 @@ else:
 if "Batt_Discharge_kWh" in df_use.columns and "Batt_Discharge_KWh" not in df_use.columns:
     df_use["Batt_Discharge_KWh"] = df_use["Batt_Discharge_kWh"]
 if "Batt_Discharge_KWh" in df_use.columns and "Batt_Discharge_kWh" not in df_use.columns:
-    df_use["Batt_Discharge_KWh"] = df_use["Batt_Discharge_KWh"]
+    df_use["Batt_Discharge_kWh"] = df_use["Batt_Discharge_KWh"]
 
 # -----------------------------------------------------------------------------
 # KPI principali
@@ -754,6 +753,7 @@ if use_ev and "EV_kWh" in df_hour.columns:
     daily["EV_kWh"] = df_hour["EV_kWh"].resample("D").sum()
 
 y_cols = [c for c in ["Total","PV_kWh","EV_kWh"] if c in daily.columns]
+
 fig_daily = px.area(
     daily,
     x=daily.index,
@@ -936,6 +936,7 @@ cum_disc = []
 def _npv(rate, cfs):
     return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cfs))
 
+
 def _irr(cfs, lo=-0.99, hi=1.5, tol=1e-6, it=200):
     def f(r): return _npv(r, cfs)
     a, b = lo, hi
@@ -1043,7 +1044,3 @@ st.download_button(
     file_name=("consumi_pv_con_batteria.csv" if use_batt else "consumi_pv_senza_batteria.csv"),
     mime="text/csv",
 )
-"""
-code_path.write_text(code_text, encoding="utf-8")
-code_path.as_posix()
-::contentReference[oaicite:0]{index=0}
