@@ -335,23 +335,45 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
         if seg_mask.any() and deficit_total > 1e-9:
             cand_idx = idx[seg_mask & idx.map(lambda t: _is_plugged_from_mask(t, plug_mask))]
             if len(cand_idx) > 0:
-                cand = df_hour.loc[cand_idx, ["PV_kWh", "Total_base", "Band"]].copy()
-                # Headroom dinamico della batteria di casa (kWh/h); fallback al valore fisso
+                cand["surplus_after_base"] = cand["PV_kWh"] - cand["Total_base"]
+                # Quanta potenza realmente la batteria può prendere (da simulazione base-only)
                 if headroom_series is not None:
-                    cand["headroom"] = headroom_series.reindex(cand.index).fillna(0.0)
+                    batt_real = headroom_series.reindex(cand.index).fillna(0.0)
                 else:
-                    cand["headroom"] = float(max(house_batt_headroom_kw, 0.0))
-
-                # Surplus FV realmente disponibile per l'EV in quell'ora
-                cand["pv_surplus_net"] = cand["PV_kWh"] - cand["Total_base"] - cand["headroom"]
-
-                good = cand[cand["pv_surplus_net"] > 0].sort_values("pv_surplus_net", ascending=False)
+                    batt_real = pd.Series(0.0, index=cand.index)
+                
+                # Limita la rivendicazione batteria al surplus disponibile
+                batt_claim = np.minimum(batt_real, np.maximum(cand["surplus_after_base"], 0.0))
+                
+                # --- URGENZA EV: calcola difficoltà di ricarica entro deadline ---
+                plugged_hours = float(cand.shape[0])  # ore utili nel segmento
+                if plugged_hours > 0:
+                    kW_needed_avg = deficit_total / plugged_hours
+                else:
+                    kW_needed_avg = 0.0
+                
+                # Trasforma la difficoltà in riduzione priorità batteria
+                urgency_raw = kW_needed_avg / max(charger_power_kw, 1e-6)  # 0..~1
+                urgency_boost = float(np.clip(urgency_raw, 0.0, 1.0)) * urgency_max_relax
+                
+                # Priorità batteria effettiva
+                prio_eff = float(np.clip(prio_pct * (1.0 - urgency_boost), 0.0, 1.0))
+                
+                # Quota batteria riservata
+                batt_claim_eff = batt_claim * prio_eff
+                
+                # Surplus FV disponibile per EV
+                cand["pv_surplus_ev"] = np.maximum(cand["surplus_after_base"] - batt_claim_eff, 0.0)
+                
+                # Ore "good" e "rest"
+                good = cand[cand["pv_surplus_ev"] > 1e-9].sort_values("pv_surplus_ev", ascending=False)
                 rest = cand.loc[cand.index.difference(good.index)]
                 if price_map is not None and len(rest) > 0:
                     rest = rest.assign(price=rest["Band"].map(price_map).fillna(np.inf)) \
                                .sort_values(by=["price", "PV_kWh"], ascending=[True, False])
                 else:
                     rest = rest.sort_values("PV_kWh", ascending=False)
+
 
                 # 1) Solo surplus FV
                 remaining = deficit_total
@@ -550,6 +572,9 @@ if use_ev:
     soc0     = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
     soc_res  = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
     p_chg    = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
+    prio_pct = st.sidebar.slider("Priorità batteria vs EV (%)", 0, 100, 70) / 100.0
+    urgency_max_relax = st.sidebar.slider("Urgenza EV: riduzione max priorità batteria (%)", 0, 100, 50) / 100.0
+    urgency_sensitivity = st.sidebar.slider("Sensibilità urgenza (km-equivalenti / ora collegata)", 1.0, 20.0, 8.0)
 
     # Routine: fino a 2 slot "via" per giorno + km/slot
     slots_cfg = {d: [] for d in DAYS}
@@ -1044,3 +1069,4 @@ st.download_button(
     file_name=("consumi_pv_con_batteria.csv" if use_batt else "consumi_pv_senza_batteria.csv"),
     mime="text/csv",
 )
+
