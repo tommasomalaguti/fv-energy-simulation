@@ -10,7 +10,7 @@ Esecuzione locale (Windows):
 """
 
 from pathlib import Path
-from datetime import time
+from datetime import time, timedelta
 from typing import Optional, List, Dict
 
 import numpy as np
@@ -214,7 +214,7 @@ def simulate_battery(df,
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
     out["Batt_Discharge_kWh"] = batt_discharge_out
-    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]  # alias
+    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]
 
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
@@ -295,16 +295,14 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                           house_batt_headroom_kw: float = 0.0,
                           headroom_series: Optional[pd.Series] = None,
                           price_map: Optional[Dict[str, float]] = None,
-                          # >>> nuovi parametri <<<
-                          prio_pct: float = 0.7,
-                          urgency_max_relax: float = 0.5) -> pd.Series:
+                          # ▼ nuovi parametri dalla UI
+                          prio_pct: float = 0.70,
+                          urgency_max_relax: float = 0.50,
+                          urgency_sensitivity: float = 8.0) -> pd.Series:
     """
     Look-ahead multi-deadline (PV-first).
     In ogni segmento tra partenze carica per tempo fino a coprire TUTTE le uscite entro lookahead_days
     (entro capacità EV). PV prima; se non basta, usa le ore "rest" ordinate per prezzo se fornito.
-    La priorità batteria vs EV è regolata da:
-      - prio_pct: quota di surplus FV che la batteria può rivendicare prima dell'EV
-      - urgency_max_relax: quanto l'urgenza dell'EV può ridurre (max) tale priorità.
     """
     idx = df_hour.index
     ev = pd.Series(0.0, index=idx, dtype=float)
@@ -341,44 +339,51 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
         if seg_mask.any() and deficit_total > 1e-9:
             cand_idx = idx[seg_mask & idx.map(lambda t: _is_plugged_from_mask(t, plug_mask))]
             if len(cand_idx) > 0:
-                # <<< riga mancante prima: costruiamo cand >>>
-                cand = df_hour.loc[cand_idx, ["PV_kWh", "Total_base", "Band"]].copy()
+                # FIX: definizione di 'cand'
+                cand = df_hour.loc[cand_idx].copy()
 
-                # surplus FV dopo i carichi base
-                cand["surplus_after_base"] = cand["PV_kWh"] - cand["Total_base"]
+                # Surplus FV dopo i carichi base (senza EV)
+                cand["surplus_after_base"] = cand["PV_KWh" if "PV_KWh" in cand.columns else "PV_kWh"] - cand["Total_base"]
 
-                # Quanta potenza realmente la batteria può prendere (da simulazione base-only)
+                # Quanta potenza realmente la batteria di casa può prendere (da simulazione base-only)
                 if headroom_series is not None:
                     batt_real = headroom_series.reindex(cand.index).fillna(0.0)
                 else:
-                    batt_real = pd.Series(float(house_batt_headroom_kw), index=cand.index)
+                    batt_real = pd.Series(0.0, index=cand.index)
 
-                # La batteria non può prendersi più del surplus disponibile
-                batt_claim = np.minimum(batt_real, np.maximum(cand["surplus_after_base"], 0.0))
+                # Limita la rivendicazione batteria al surplus disponibile (allineato per indice)
+                surplus = cand["surplus_after_base"].clip(lower=0.0)
+                batt_claim = pd.concat([batt_real, surplus], axis=1).min(axis=1)
 
-                # --- URGENZA EV: se ci sono poche ore utili prima della partenza, abbasso la priorità batteria ---
-                plugged_hours = float(cand.shape[0])
-                kW_needed_avg = (deficit_total / plugged_hours) if plugged_hours > 0 else 0.0
-                urgency_raw = kW_needed_avg / max(charger_power_kw, 1e-6)         # 0..1
-                urgency_boost = float(np.clip(urgency_raw, 0.0, 1.0)) * urgency_max_relax
+                # --- URGENZA EV: riduce la priorità della batteria quando il tempo utile è scarso ---
+                plugged_hours = float(cand.shape[0])  # ore utili
+                if plugged_hours > 0:
+                    kW_needed_avg = deficit_total / plugged_hours
+                else:
+                    kW_needed_avg = 0.0
+
+                urgency_raw = kW_needed_avg / max(charger_power_kw, 1e-6)  # 0..~1
+                urgency_boost = float(np.clip(urgency_raw, 0.0, 1.0)) * float(urgency_max_relax)
+
+                # Priorità batteria effettiva: tra 0 e 1
                 prio_eff = float(np.clip(prio_pct * (1.0 - urgency_boost), 0.0, 1.0))
 
-                # quota batteria effettiva sul surplus
+                # Quota batteria riservata
                 batt_claim_eff = batt_claim * prio_eff
 
-                # Surplus FV disponibile per EV dopo la quota batteria
-                cand["pv_surplus_ev"] = np.maximum(cand["surplus_after_base"] - batt_claim_eff, 0.0)
+                # Surplus FV realmente disponibile per EV
+                cand["pv_surplus_ev"] = (surplus - batt_claim_eff).clip(lower=0.0)
 
-                # Ore "good" (solo FV) e "rest" (senza FV sufficiente → eventuale rete)
+                # Ore "good" (surplus FV) e "rest"
                 good = cand[cand["pv_surplus_ev"] > 1e-9].sort_values("pv_surplus_ev", ascending=False)
                 rest = cand.loc[cand.index.difference(good.index)]
                 if price_map is not None and len(rest) > 0:
                     rest = rest.assign(price=rest["Band"].map(price_map).fillna(np.inf)) \
-                               .sort_values(by=["price", "PV_kWh"], ascending=[True, False])
+                               .sort_values(by=["price", "PV_kWh" if "PV_kWh" in rest.columns else "PV_KWh"], ascending=[True, False])
                 else:
-                    rest = rest.sort_values("PV_kWh", ascending=False)
+                    rest = rest.sort_values("PV_kWh" if "PV_kWh" in rest.columns else "PV_KWh", ascending=False)
 
-                # 1) Carico sulle ore di solo surplus FV
+                # 1) Solo surplus FV
                 remaining = deficit_total
                 for ts in good.index:
                     if remaining <= 0:
@@ -391,7 +396,7 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                     soc = min(soc + put, batt_capacity_kwh)
                     remaining -= put
 
-                # 2) Se non basta, uso le ore rest (minimo indispensabile)
+                # 2) Se non basta, usa ore rest (minimo indispensabile, ordinate per prezzo/PV)
                 if remaining > 1e-9 and len(rest) > 0:
                     for ts in rest.index:
                         if remaining <= 0:
@@ -411,6 +416,7 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
 
     return ev
 
+
 def plan_ev_auto(df_hour: pd.DataFrame,
                  slots_cfg: dict,
                  km_per_slot: dict,
@@ -423,14 +429,15 @@ def plan_ev_auto(df_hour: pd.DataFrame,
                  house_batt_p_charge_kw: float,
                  price_map: dict,
                  headroom_series: Optional[pd.Series] = None,
-                 # nuovi parametri pass-through
-                 prio_pct: float = 0.7,
-                 urgency_max_relax: float = 0.5) -> pd.Series:
+                 # ▼ inoltra i parametri delle slider
+                 prio_pct: float = 0.70,
+                 urgency_max_relax: float = 0.50,
+                 urgency_sensitivity: float = 8.0) -> pd.Series:
     """
     Ottimizzatore automatico:
       - Look-ahead = 7 giorni
-      - PV-first: priorità al surplus FV; la batteria domestica mantiene priorità configurabile
-      - Le ore non-FV si ordinano per prezzo (F3→F2→F1) se servono
+      - PV-first rigido: prima usa solo ore con surplus FV al netto della batteria di casa
+      - Se non basta entro la deadline: sblocca il minimo di ore restanti, ordinate per prezzo (F3→F2→F1)
     """
     headroom = house_batt_p_charge_kw if use_batt else 0.0
 
@@ -450,6 +457,7 @@ def plan_ev_auto(df_hour: pd.DataFrame,
         price_map=price_map,
         prio_pct=prio_pct,
         urgency_max_relax=urgency_max_relax,
+        urgency_sensitivity=urgency_sensitivity,
     )
 
 # -----------------------------------------------------------------------------
@@ -504,6 +512,7 @@ if n_dup > 0:
 
 # 1) Collassa duplicati (somma numeriche kWh/ora)
 num_cols = df_filt.select_dtypes(include="number").columns
+
 df_no_dups = (
     df_filt
     .sort_index()
@@ -566,6 +575,8 @@ soc_init= st.sidebar.slider("SOC iniziale (%)", min_value=0, max_value=100, valu
 # -----------------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.header("🚗 Ricarica EV (Auto)")
+st.sidebar.info("Nuove opzioni: Priorità batteria vs EV, Urgenza EV")
+
 use_ev = st.sidebar.checkbox("Attiva ricarica EV (ottimizzata FV)", value=True)
 
 # salva carico base prima dell'EV
@@ -578,10 +589,9 @@ if use_ev:
     soc0     = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
     soc_res  = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
     p_chg    = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
-
-    # >>> nuovi controlli EV <<<
     prio_pct = st.sidebar.slider("Priorità batteria vs EV (%)", 0, 100, 70) / 100.0
     urgency_max_relax = st.sidebar.slider("Urgenza EV: riduzione max priorità batteria (%)", 0, 100, 50) / 100.0
+    urgency_sensitivity = st.sidebar.slider("Sensibilità urgenza (placeholder)", 1.0, 20.0, 8.0)
 
     # Routine: fino a 2 slot "via" per giorno + km/slot
     slots_cfg = {d: [] for d in DAYS}
@@ -638,10 +648,11 @@ if use_ev:
         headroom_series=headroom_dyn,
         prio_pct=prio_pct,
         urgency_max_relax=urgency_max_relax,
+        urgency_sensitivity=urgency_sensitivity,
     )
     df_hour["EV_kWh"] = ev_profile
 else:
-    df_hour["EV_kWh"] = 0.0
+    df_hour["EV_KWh" if "EV_KWh" in df_hour.columns else "EV_kWh"] = 0.0
 
 # Applica EV al carico e ricalcola grandezze senza batteria
 df_hour["Total"] = df_hour["Total_base"] + df_hour["EV_kWh"]
@@ -712,7 +723,7 @@ if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_kWh"}.issubset(b
 prelievo_baseline = baseline["NetGrid_KWh"].sum() if "NetGrid_KWh" in baseline.columns else 0.0
 autocons_baseline = baseline["Autocons_kWh"].sum() if "Autocons_kWh" in baseline.columns else 0.0
 
-prelievo_scenario = df_use["NetGrid_KWh_batt"].sum() if use_batt else prelievo_baseline
+prelievo_scenario = df_use["NetGrid_KWh_batt"].sum() if "NetGrid_KWh_batt" in df_use.columns else prelievo_baseline
 autocons_scenario = df_use[AUTOCONS].sum()
 
 kwh_prelievo_ev = prelievo_baseline - prelievo_scenario
@@ -813,7 +824,13 @@ if use_batt and "Batt_SOC_kWh" in df_use.columns:
 # Bilancio mensile energia
 # -----------------------------------------------------------------------------
 st.subheader("Bilancio mensile energia")
-monthly = df_use[[AUTOCONS, NET, EXPORT]].resample("MS").sum()
+monthly = df_use[["Autocons_kWh_batt" if "Autocons_kWh_batt" in df_use.columns else "Autocons_kWh",
+                  "NetGrid_KWh_batt" if "NetGrid_KWh_batt" in df_use.columns else "NetGrid_KWh",
+                  "Export_KWh_batt" if "Export_KWh_batt" in df_use.columns else "Export_KWh"]].resample("MS").sum()
+AUTOCONS = "Autocons_kWh_batt" if "Autocons_kWh_batt" in df_use.columns else "Autocons_kWh"
+NET      = "NetGrid_KWh_batt" if "NetGrid_KWh_batt" in df_use.columns else "NetGrid_KWh"
+EXPORT   = "Export_KWh_batt"  if "Export_KWh_batt"  in df_use.columns else "Export_KWh"
+
 fig_month = go.Figure()
 fig_month.add_bar(x=monthly.index.strftime("%Y-%m"), y=monthly[AUTOCONS], name="Autoconsumo")
 fig_month.add_bar(x=monthly.index.strftime("%Y-%m"), y=monthly[NET], name="Prelievo rete")
@@ -878,8 +895,8 @@ imp_b, rev_b, net_b, mon_b = compute_costs(baseline, "NetGrid_KWh", "Export_KWh"
 # Scenario attivo (con o senza batteria)
 imp_s, rev_s, net_s, mon_s = compute_costs(
     df_use,
-    "NetGrid_KWh_batt" if use_batt else "NetGrid_KWh",
-    "Export_KWh_batt"  if use_batt else "Export_KWh",
+    "NetGrid_KWh_batt" if "NetGrid_KWh_batt" in df_use.columns else "NetGrid_KWh",
+    "Export_KWh_batt"  if "Export_KWh_batt"  in df_use.columns else "Export_KWh",
 )
 
 # KPI economici principali
