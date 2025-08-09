@@ -1,6 +1,5 @@
 """
 Streamlit dashboard: Consumi & Produzione FV – 12 mesi (Auto EV Optimizer)
-==========================================================================
 
 Prerequisiti:
     pip install streamlit pandas plotly numpy
@@ -296,11 +295,12 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                           headroom_series: Optional[pd.Series] = None,
                           price_map: Optional[Dict[str, float]] = None,
                           prio_pct: float = 0.7,
-                          urgency_max_relax: float = 0.5) -> pd.Series:
+                          urgency_max_relax: float = 0.5,
+                          allow_grid: bool = True) -> pd.Series:
     """
     Look-ahead multi-deadline (PV-first).
-    In ogni segmento tra partenze carica per tempo fino a coprire TUTTE le uscite entro lookahead_days
-    (entro capacità EV). PV prima; se non basta, usa le ore "rest" ordinate per prezzo se fornito.
+    In ogni segmento tra partenze carica fino a coprire TUTTE le uscite entro lookahead_days (entro capacità EV).
+    PV prima; se non basta, usa le ore "rest" ordinate per prezzo (se consentito).
     """
     idx = df_hour.index
     ev = pd.Series(0.0, index=idx, dtype=float)
@@ -337,12 +337,10 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
         if seg_mask.any() and deficit_total > 1e-9:
             cand_idx = idx[seg_mask & idx.map(lambda t: _is_plugged_from_mask(t, plug_mask))]
             if len(cand_idx) > 0:
-                cand = df_hour.loc[cand_idx].copy()
-
-                # Surplus FV al netto dei carichi base (senza EV)
+                cand = df_hour.loc[cand_idx].copy()  # BUGFIX: creare il DataFrame "cand"
                 cand["surplus_after_base"] = cand["PV_kWh"] - cand["Total_base"]
 
-                # Quanta potenza la batteria di casa "reclama" realmente (da simulazione base-only)
+                # Quanta potenza realmente la batteria di casa può prendere (da simulazione base-only)
                 if headroom_series is not None:
                     batt_real = headroom_series.reindex(cand.index).fillna(0.0)
                 else:
@@ -351,25 +349,32 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                 # Limita la rivendicazione batteria al surplus disponibile
                 batt_claim = np.minimum(batt_real, np.maximum(cand["surplus_after_base"], 0.0))
 
-                # --- URGENZA EV: se ci sono poche ore utili, riduci la priorità batteria ---
+                # --- URGENZA EV: calcola difficoltà di ricarica entro deadline ---
                 plugged_hours = float(cand.shape[0])  # ore utili nel segmento
-                kW_needed_avg = (deficit_total / plugged_hours) if plugged_hours > 0 else 0.0
+                if plugged_hours > 0:
+                    kW_needed_avg = deficit_total / plugged_hours
+                else:
+                    kW_needed_avg = 0.0
+
+                # Trasforma la difficoltà in riduzione priorità batteria
                 urgency_raw = kW_needed_avg / max(charger_power_kw, 1e-6)  # 0..~1
                 urgency_boost = float(np.clip(urgency_raw, 0.0, 1.0)) * urgency_max_relax
 
+                # Priorità batteria effettiva
                 prio_eff = float(np.clip(prio_pct * (1.0 - urgency_boost), 0.0, 1.0))
+
+                # Quota batteria riservata
                 batt_claim_eff = batt_claim * prio_eff
 
-                # Surplus FV effettivamente disponibile per EV
+                # Surplus FV disponibile per EV
                 cand["pv_surplus_ev"] = np.maximum(cand["surplus_after_base"] - batt_claim_eff, 0.0)
 
-                # Ore "good" (con surplus) e ore "rest" (senza)
+                # Ore "good" (solo surplus FV netto) e "rest" (il resto, ordinate per prezzo)
                 good = cand[cand["pv_surplus_ev"] > 1e-9].sort_values("pv_surplus_ev", ascending=False)
                 rest = cand.loc[cand.index.difference(good.index)]
                 if price_map is not None and len(rest) > 0:
                     rest = rest.assign(price=rest["Band"].map(price_map).fillna(np.inf)) \
-                               .sort_values(by=["price", "PV_KWh" if "PV_KWh" in rest.columns else "PV_kWh"],
-                                            ascending=[True, False])
+                               .sort_values(by=["price", "PV_kWh"], ascending=[True, False])
                 else:
                     rest = rest.sort_values("PV_kWh", ascending=False)
 
@@ -387,7 +392,7 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                     remaining -= put
 
                 # 2) Se non basta, usa ore rest (minimo indispensabile, ordinate per prezzo/PV)
-                if remaining > 1e-9 and len(rest) > 0:
+                if remaining > 1e-9 and len(rest) > 0 and allow_grid:
                     for ts in rest.index:
                         if remaining <= 0:
                             break
@@ -419,10 +424,12 @@ def plan_ev_auto(df_hour: pd.DataFrame,
                  price_map: dict,
                  headroom_series: Optional[pd.Series] = None,
                  prio_pct: float = 0.7,
-                 urgency_max_relax: float = 0.5) -> pd.Series:
+                 urgency_max_relax: float = 0.5,
+                 lookahead_days: int = 7,
+                 allow_grid: bool = True) -> pd.Series:
     """
     Ottimizzatore automatico:
-      - Look-ahead = 7 giorni
+      - Look-ahead configurabile
       - PV-first rigido: prima usa solo ore con surplus FV al netto della batteria di casa
       - Se non basta entro la deadline: sblocca il minimo di ore restanti, ordinate per prezzo (F3→F2→F1)
     """
@@ -437,13 +444,14 @@ def plan_ev_auto(df_hour: pd.DataFrame,
         soc_init_frac=soc_init_frac,
         soc_min_frac=soc_min_frac,
         charger_power_kw=charger_power_kw,
-        lookahead_days=7,
+        lookahead_days=lookahead_days,
         prefer_pv_only=True,
         house_batt_headroom_kw=headroom,
         headroom_series=headroom_series,
         price_map=price_map,
         prio_pct=prio_pct,
         urgency_max_relax=urgency_max_relax,
+        allow_grid=allow_grid,
     )
 
 # -----------------------------------------------------------------------------
@@ -565,6 +573,7 @@ use_ev = st.sidebar.checkbox("Attiva ricarica EV (ottimizzata FV)", value=True)
 
 # salva carico base prima dell'EV
 df_hour["Total_base"] = df_hour.get("Total", 0).copy()
+df_hour["PV_surplus_after_base"] = (df_hour["PV_kWh"] - df_hour["Total_base"]).clip(lower=0)
 
 if use_ev:
     # Parametri veicolo/caricatore
@@ -573,10 +582,11 @@ if use_ev:
     soc0     = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
     soc_res  = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
     p_chg    = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
-
     prio_pct = st.sidebar.slider("Priorità batteria vs EV (%)", 0, 100, 70) / 100.0
     urgency_max_relax = st.sidebar.slider("Urgenza EV: riduzione max priorità batteria (%)", 0, 100, 50) / 100.0
-    st.sidebar.slider("Sensibilità urgenza (placeholder)", 1.0, 20.0, 8.0)  # attualmente non usato
+    urgency_sensitivity = st.sidebar.slider("Sensibilità urgenza (placeholder)", 1.0, 20.0, 8.0)
+    lookahead_days = st.sidebar.slider("Anticipo ricariche (giorni)", 1, 7, 2)
+    allow_grid = st.sidebar.checkbox("Consenti carica da rete quando il FV non basta", value=True)
 
     # Routine: fino a 2 slot "via" per giorno + km/slot
     slots_cfg = {d: [] for d in DAYS}
@@ -633,6 +643,8 @@ if use_ev:
         headroom_series=headroom_dyn,
         prio_pct=prio_pct,
         urgency_max_relax=urgency_max_relax,
+        lookahead_days=lookahead_days,
+        allow_grid=allow_grid,
     )
     df_hour["EV_kWh"] = ev_profile
 else:
@@ -771,35 +783,6 @@ if use_ev:
         fig_ev.update_layout(yaxis_title="kWh", xaxis_title="")
         st.plotly_chart(fig_ev, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# DIAGNOSTICA EV (ore con sole, fasce, profilo giornaliero)
-# -----------------------------------------------------------------------------
-st.subheader("Diagnostica ricarica EV")
-diag = df_hour.copy()
-diag["PV_surplus_after_base"] = (diag["PV_kWh"] - diag["Total_base"]).clip(lower=0)
-if use_batt and "Batt_Charge_kWh" in df_use.columns:
-    diag["PV_surplus_after_base"] = (diag["PV_surplus_after_base"] - df_use["Batt_Charge_kWh"]).clip(lower=0)
-
-ev_on_sun = float(np.minimum(diag["EV_kWh"], diag["PV_surplus_after_base"]).sum())
-ev_total  = float(diag["EV_kWh"].sum())
-st.metric("Quota EV in ore con FV disponibile", f"{(100*ev_on_sun/ev_total if ev_total else 0):.1f}%")
-
-ev_by_band = diag.groupby("Band")["EV_kWh"].sum().reindex(["F1","F2","F3"]).fillna(0)
-fig_ev_band = px.bar(ev_by_band, labels={"value":"kWh", "index":"Fascia"}, title="EV per fascia ARERA")
-st.plotly_chart(fig_ev_band, use_container_width=True)
-
-giorni_disp = pd.to_datetime(diag.index.date).unique()
-g_sel = st.date_input("Giorno di dettaglio", value=pd.to_datetime(giorni_disp[-1]).date(),
-                      min_value=pd.to_datetime(giorni_disp[0]).date(),
-                      max_value=pd.to_datetime(giorni_disp[-1]).date())
-mask_day = (diag.index.date == g_sel)
-day_view = pd.DataFrame({
-    "EV_kWh": diag.loc[mask_day, "EV_kWh"],
-    "PV_surplus_after_base": diag.loc[mask_day, "PV_surplus_after_base"],
-})
-fig_day = px.line(day_view, labels={"value":"kWh/ora", "index":"Ora"}, title=f"Profilo orario {g_sel}")
-st.plotly_chart(fig_day, use_container_width=True)
-
 st.divider()
 
 # -----------------------------------------------------------------------------
@@ -820,6 +803,21 @@ fig_daily = px.area(
 )
 fig_daily.update_layout(legend_orientation="h", legend_y=-0.2)
 st.plotly_chart(fig_daily, use_container_width=True)
+
+# -----------------------------------------------------------------------------
+# Profilo orario – Giorno di dettaglio (per debug EV)
+# -----------------------------------------------------------------------------
+with st.expander("🔬 Giorno di dettaglio – profilo orario", expanded=False):
+    day_pick = st.date_input("Giorno di dettaglio", value=max_date, min_value=min_date, max_value=max_date)
+    df_day = df_hour.loc[(df_hour.index.date == day_pick)]
+    if not df_day.empty:
+        tmp = df_day[["EV_kWh", "PV_surplus_after_base"]].copy()
+        tmp = tmp.rename(columns={"EV_kWh":"EV_kWh", "PV_surplus_after_base":"PV_surplus_after_base"})
+        fig_day = px.line(tmp, labels={"value":"kWh/ora", "index":"Ora"})
+        fig_day.update_layout(title=f"Profilo orario {day_pick}")
+        st.plotly_chart(fig_day, use_container_width=True)
+    else:
+        st.info("Nessun dato per il giorno selezionato.")
 
 # -----------------------------------------------------------------------------
 # Grafico SOC batteria
@@ -844,23 +842,6 @@ fig_month.add_bar(x=monthly.index.strftime("%Y-%m"), y=monthly[NET], name="Preli
 fig_month.add_bar(x=monthly.index.strftime("%Y-%m"), y=monthly[EXPORT], name="Export")
 fig_month.update_layout(barmode="stack", yaxis_title="kWh", xaxis_title="Mese")
 st.plotly_chart(fig_month, use_container_width=True)
-
-# -----------------------------------------------------------------------------
-# Heat-map autoconsumo (ora × settimana ISO)
-# -----------------------------------------------------------------------------
-st.subheader("Heat-map autoconsumo (ora × settimana ISO)")
-week_series = df_use.index.isocalendar().week
-pivot = (
-    df_use.assign(week=week_series)
-          .pivot_table(index=df_use.index.hour, columns="week", values=AUTOCONS, aggfunc="sum")
-)
-fig_heat = px.imshow(
-    pivot,
-    labels=dict(x="Settimana ISO", y="Ora", color="kWh autocons"),
-    aspect="auto",
-)
-fig_heat.update_yaxes(dtick=1)
-st.plotly_chart(fig_heat, use_container_width=True)
 
 st.divider()
 
