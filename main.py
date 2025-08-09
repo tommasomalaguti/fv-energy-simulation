@@ -10,6 +10,9 @@ Esecuzione locale (Windows):
 """
 
 from pathlib import Path
+from datetime import time, timedelta
+from typing import Optional, List, Dict
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -220,6 +223,112 @@ def simulate_battery(df,
     return out
 
 # -----------------------------------------------------------------------------
+# EV charging helpers
+# -----------------------------------------------------------------------------
+DAYS: List[str] = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+DAY_IDX: Dict[str, int] = {name: i for i, name in enumerate(DAYS)}
+
+def build_ev_profile(index: pd.DatetimeIndex,
+                     mode: str = "Orario fisso",
+                     power_kw: float = 3.0,
+                     energy_session_kwh: float = 10.0,
+                     efficiency_ac_to_batt: float = 0.92,
+                     start_time: time = time(22, 0),
+                     window_h: int = 8,
+                     days_sel: Optional[List[str]] = None,
+                     pv_series: Optional[pd.Series] = None) -> pd.Series:
+    """
+    Crea una serie oraria (kWh/h) di ricarica EV sul LATO AC (energia dalla rete/impianto).
+    - mode: 'Orario fisso' → riempie sequenzialmente la finestra
+            'PV-priority' → sceglie le ore con PV più alto nella finestra.
+    - power_kw: potenza massima del caricatore AC per 1h.
+    - energy_session_kwh: energia desiderata *nel pacco batteria* per ogni sessione.
+    - efficiency_ac_to_batt: rendimento (es. 0.92). AC_kWh = energy_session / eff.
+    - start_time + window_h: finestra consentita in ogni giorno selezionato.
+    - days_sel: lista giorni es. ['Lun','Mer','Ven'].
+    - pv_series: PV_kWh oraria usata da 'PV-priority' per ordinare le ore.
+    """
+    if days_sel is None:
+        days_sel = ["Lun", "Mer", "Ven"]
+    tz = index.tz
+    ev = pd.Series(0.0, index=index)
+
+    ac_energy_needed = energy_session_kwh / max(efficiency_ac_to_batt, 1e-9)
+    if ac_energy_needed <= 0 or power_kw <= 0 or window_h <= 0:
+        return ev
+
+    # Raggruppa per giorno (data locale)
+    all_days = pd.to_datetime(index.tz_convert(tz).date).unique()
+    sel_idx = {DAY_IDX[d] for d in days_sel if d in DAY_IDX}
+
+    for d in all_days:
+        d = pd.Timestamp(d).tz_localize(tz)
+        if d.weekday() not in sel_idx:
+            continue
+
+        start = d + timedelta(hours=start_time.hour, minutes=start_time.minute)
+        end = start + timedelta(hours=window_h)
+        mask = (index >= start) & (index < end)
+        if not mask.any():
+            continue
+
+        remaining = ac_energy_needed
+
+        if mode == "PV-priority" and pv_series is not None:
+            order = pv_series.loc[mask].sort_values(ascending=False).index
+        else:
+            order = index[mask]
+
+        for ts in order:
+            if remaining <= 0:
+                break
+            put = min(power_kw, remaining)
+            ev.loc[ts] += put
+            remaining -= put
+
+    return ev
+
+def split_ev_coverage(df_base: pd.DataFrame,
+                      df_with_batt: Optional[pd.DataFrame],
+                      use_batt: bool) -> Dict[str, float]:
+    """
+    Stima quanto dell'energia EV (df_base['EV_kWh']) è coperta da:
+      - FV diretto
+      - Batteria (se attiva)
+      - Rete
+    Approccio: prima assegna il PV in eccesso 'incrementale' dovuto all'EV;
+    poi ripartisce la scarica batteria proporzionalmente al residuo di carico.
+    """
+    pv = df_base["PV_kWh"]
+    total_base = df_base["Total_base"]          # carichi senza EV
+    total_with_ev = df_base["Total"]            # carichi con EV
+    ev = df_base["EV_kWh"]
+
+    pv_used_with_ev  = np.minimum(pv, total_with_ev)
+    pv_used_baseonly = np.minimum(pv, total_base)
+    ev_from_pv = (pv_used_with_ev - pv_used_baseonly).clip(lower=0)
+
+    ev_rem_after_pv = (ev - ev_from_pv).clip(lower=0)
+
+    if use_batt and df_with_batt is not None and "Batt_Discharge_kWh" in df_with_batt.columns:
+        batt_dis = df_with_batt["Batt_Discharge_kWh"]
+        base_rem_after_pv = (total_base - pv_used_baseonly).clip(lower=0)
+        denom = base_rem_after_pv + ev_rem_after_pv
+        share = np.divide(ev_rem_after_pv, denom, out=np.zeros_like(ev_rem_after_pv), where=denom > 0)
+        ev_from_batt = batt_dis * share
+    else:
+        ev_from_batt = pd.Series(0.0, index=df_base.index)
+
+    ev_from_grid = (ev - ev_from_pv - ev_from_batt).clip(lower=0)
+
+    return {
+        "pv": float(ev_from_pv.sum()),
+        "batt": float(ev_from_batt.sum()),
+        "grid": float(ev_from_grid.sum()),
+        "total": float(ev.sum())
+    }
+
+# -----------------------------------------------------------------------------
 # Sidebar – upload e preset batteria
 # -----------------------------------------------------------------------------
 st.sidebar.title("⚙️ Impostazioni")
@@ -316,13 +425,54 @@ for c in ["Total", "PV_kWh", "Autocons_kWh"]:
     if c in df_hour.columns:
         df_hour[c] = df_hour[c].fillna(0)
 
+# -----------------------------------------------------------------------------
+# 🚗 Auto elettrica – profilo di ricarica
+# -----------------------------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.header("🚗 Ricarica auto elettrica")
+
+use_ev = st.sidebar.checkbox("Include ricarica EV", value=False)
+if use_ev:
+    ev_mode = st.sidebar.selectbox("Modalità ricarica", ["Orario fisso", "PV-priority"], index=0)
+    ev_power = st.sidebar.number_input("Potenza caricatore (kW)", min_value=0.5, max_value=22.0, value=3.0, step=0.5)
+    ev_energy = st.sidebar.number_input("Energia per sessione (kWh, nel pacco EV)", min_value=1.0, max_value=120.0, value=10.0, step=0.5)
+    ev_eff = st.sidebar.slider("Efficienza AC→batt EV", min_value=0.70, max_value=1.00, value=0.92, step=0.01)
+    ev_start = st.sidebar.time_input("Ora inizio finestra", value=time(22, 0))
+    ev_window = st.sidebar.slider("Durata finestra (ore)", 1, 12, 8)
+    ev_days = st.sidebar.multiselect("Giorni con sessione", DAYS, default=["Lun", "Mer", "Ven"])
+
+# Salva il carico base e – se attivo – aggiungi EV al totale
+df_hour["Total_base"] = df_hour.get("Total", 0).copy()
+
+if use_ev:
+    ev_profile = build_ev_profile(
+        index=df_hour.index,
+        mode=ev_mode,
+        power_kw=ev_power,
+        energy_session_kwh=ev_energy,
+        efficiency_ac_to_batt=ev_eff,
+        start_time=ev_start,
+        window_h=int(ev_window),
+        days_sel=ev_days,
+        pv_series=df_hour.get("PV_kWh", None)
+    )
+    df_hour["EV_kWh"] = ev_profile
+    df_hour["Total"] = df_hour["Total_base"] + df_hour["EV_kWh"]
+
+    # (ri)deriva autoconsumo/export/rete senza batteria (coerenti con il nuovo carico)
+    df_hour["Autocons_kWh"] = np.minimum(df_hour["PV_kWh"], df_hour["Total"])
+    df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
+    df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
+else:
+    df_hour["EV_kWh"] = 0.0
+
 # Export/NetGrid naming robusto
 export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
 if export_col is None:
     df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
     export_col = "Export_KWh"
 
-net_col = "NetGrid_KWh" if "NetGrid_KWh" in df_hour.columns else ("NetGrid_kWh" if "NetGrid_kWh" in df_hour.columns else None)
+net_col = "NetGrid_KWh" if "NetGrid_KWh" in df_hour.columns else ("NetGrid_kWh" if "NetGrid_KWh" in df_hour.columns else None)
 if net_col is None and {"Total","Autocons_kWh"}.issubset(df_hour.columns):
     df_hour["NetGrid_KWh"] = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
     net_col = "NetGrid_KWh"
@@ -389,6 +539,27 @@ c1, c2 = st.columns(2)
 c1.metric("Prelievo evitato (kWh)", f"{kwh_prelievo_ev:,.0f}")
 c2.metric("Autoconsumo FV aggiuntivo (kWh)", f"{kwh_autocons_add:,.0f}")
 
+# -----------------------------------------------------------------------------
+# KPI ricarica EV – copertura da PV/Batteria/Rete
+# -----------------------------------------------------------------------------
+if use_ev:
+    cover = split_ev_coverage(df_hour, df_use if use_batt else None, use_batt=use_batt)
+    ev_tot = cover["total"]
+    with st.expander("🔎 Ricarica EV – ripartizione fonti", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Energia EV totale (kWh)", f"{ev_tot:,.0f}")
+        c2.metric("Coperta da FV diretto (kWh)", f"{cover['pv']:,.0f}")
+        c3.metric("Coperta da Batteria (kWh)", f"{cover['batt']:,.0f}")
+        c4.metric("Dalla Rete (kWh)", f"{cover['grid']:,.0f}")
+
+        ev_df = pd.DataFrame({
+            "Fonte": ["FV diretto", "Batteria", "Rete"],
+            "kWh": [cover["pv"], cover["batt"], cover["grid"]]
+        })
+        fig_ev = px.bar(ev_df, x="Fonte", y="kWh", text_auto=".0f", title="Copertura ricarica EV")
+        fig_ev.update_layout(yaxis_title="kWh", xaxis_title="")
+        st.plotly_chart(fig_ev, use_container_width=True)
+
 st.divider()
 
 # -----------------------------------------------------------------------------
@@ -396,10 +567,14 @@ st.divider()
 # -----------------------------------------------------------------------------
 st.subheader("Andamento giornaliero – Carichi vs Produzione FV")
 daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
+if use_ev and "EV_kWh" in df_use.columns:
+    daily["EV_kWh"] = df_use["EV_kWh"].resample("D").sum()
+
+y_cols = ["Total", "PV_kWh"] + (["EV_kWh"] if "EV_kWh" in daily.columns else [])
 fig_daily = px.area(
     daily,
     x=daily.index,
-    y=["Total", "PV_kWh"],
+    y=y_cols,
     labels={"value": "kWh al giorno", "variable": ""},
 )
 fig_daily.update_layout(legend_orientation="h", legend_y=-0.2)
