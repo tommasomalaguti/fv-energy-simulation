@@ -1,6 +1,6 @@
 """
-Streamlit dashboard: Consumi & Produzione FV – 12 mesi (Feb 2024 → Gen 2025)
-============================================================================
+Streamlit dashboard: Consumi & Produzione FV – 12 mesi (Auto EV Optimizer)
+==========================================================================
 
 Prerequisiti:
     pip install streamlit pandas plotly numpy
@@ -165,10 +165,10 @@ def simulate_battery(df,
     soc_min = soc_min_frac * capacity_kwh
     soc0    = soc_init_frac * capacity_kwh
 
-    pv_direct = np.zeros(n)          # FV usata direttamente
-    pv_surplus = np.zeros(n)         # FV eccedente dopo uso diretto
-    batt_charge_in = np.zeros(n)     # energia che FINISCE in batteria (dopo efficienza di carica)
-    batt_discharge_out = np.zeros(n) # energia dalla batteria ai carichi (lato AC, già con efficienza di scarica)
+    pv_direct = np.zeros(n)
+    pv_surplus = np.zeros(n)
+    batt_charge_in = np.zeros(n)
+    batt_discharge_out = np.zeros(n)
     import_grid = np.zeros(n)
     export_grid = np.zeros(n)
 
@@ -211,11 +211,10 @@ def simulate_battery(df,
         soc[t] = np.clip(soc_new, soc_min, soc_max)
         soc_prev = soc[t]
 
-    # Alias coerenti
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
     out["Batt_Discharge_kWh"] = batt_discharge_out
-    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]  # compatibilità
+    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]
 
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
@@ -225,197 +224,19 @@ def simulate_battery(df,
     return out
 
 # -----------------------------------------------------------------------------
-# EV helpers (modalità per sessione e per km + overnight)
+# EV – Auto Optimizer (PV-first) con look-ahead e multi-slot
 # -----------------------------------------------------------------------------
 DAYS: List[str] = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 DAY_IDX: Dict[str, int] = {name: i for i, name in enumerate(DAYS)}
 
-def build_ev_profile(index: pd.DatetimeIndex,
-                     mode: str = "Orario fisso",
-                     power_kw: float = 3.0,
-                     energy_session_kwh: float = 10.0,
-                     efficiency_ac_to_batt: float = 0.92,
-                     start_time: time = time(22, 0),
-                     window_h: int = 8,
-                     days_sel: Optional[List[str]] = None,
-                     pv_series: Optional[pd.Series] = None) -> pd.Series:
-    """
-    Serie oraria (kWh/h lato AC) di ricarica EV.
-    - 'Orario fisso': riempie la finestra in ordine.
-    - 'PV-priority': riempie prima le ore con PV più alto nella finestra.
-    """
-    if days_sel is None:
-        days_sel = ["Lun", "Mer", "Ven"]
-    tz = index.tz
-    ev = pd.Series(0.0, index=index)
-
-    ac_energy_needed = energy_session_kwh / max(efficiency_ac_to_batt, 1e-9)
-    if ac_energy_needed <= 0 or power_kw <= 0 or window_h <= 0:
-        return ev
-
-    all_days = pd.to_datetime(index.tz_convert(tz).date).unique()
-    sel_idx = {DAY_IDX[d] for d in days_sel if d in DAY_IDX}
-
-    for d in all_days:
-        d = pd.Timestamp(d).tz_localize(tz)
-        if d.weekday() not in sel_idx:
-            continue
-
-        start = d + timedelta(hours=start_time.hour, minutes=start_time.minute)
-        end = start + timedelta(hours=window_h)
-        mask = (index >= start) & (index < end)
-        if not mask.any():
-            continue
-
-        remaining = ac_energy_needed
-
-        if mode == "PV-priority" and pv_series is not None:
-            order = pv_series.loc[mask].sort_values(ascending=False).index
-        else:
-            order = index[mask]
-
-        for ts in order:
-            if remaining <= 0:
-                break
-            put = min(power_kw, remaining)
-            ev.loc[ts] += put
-            remaining -= put
-
-    return ev
-
-def split_ev_coverage(df_base: pd.DataFrame,
-                      df_with_batt: Optional[pd.DataFrame],
-                      use_batt: bool) -> Dict[str, float]:
-    """
-    Ripartisce EV_kWh tra FV diretto, Batteria e Rete.
-    """
-    pv = df_base["PV_kWh"]
-    total_base = df_base["Total_base"]
-    total_with_ev = df_base["Total"]
-    ev = df_base["EV_kWh"]
-
-    pv_used_with_ev  = np.minimum(pv, total_with_ev)
-    pv_used_baseonly = np.minimum(pv, total_base)
-    ev_from_pv = (pv_used_with_ev - pv_used_baseonly).clip(lower=0)
-
-    ev_rem_after_pv = (ev - ev_from_pv).clip(lower=0)
-
-    if use_batt and df_with_batt is not None and "Batt_Discharge_kWh" in df_with_batt.columns:
-        batt_dis = df_with_batt["Batt_Discharge_kWh"]
-        base_rem_after_pv = (total_base - pv_used_baseonly).clip(lower=0)
-        denom = base_rem_after_pv + ev_rem_after_pv
-        share = np.divide(ev_rem_after_pv, denom, out=np.zeros_like(ev_rem_after_pv), where=denom > 0)
-        ev_from_batt = batt_dis * share
-    else:
-        ev_from_batt = pd.Series(0.0, index=df_base.index)
-
-    ev_from_grid = (ev - ev_from_pv - ev_from_batt).clip(lower=0)
-
-    return {
-        "pv": float(ev_from_pv.sum()),
-        "batt": float(ev_from_batt.sum()),
-        "grid": float(ev_from_grid.sum()),
-        "total": float(ev.sum())
-    }
-
-# --- Planner per km + overnight (semplice) ---
-def _km_dict_to_array(km_per_day_dict: dict) -> np.ndarray:
-    order = ["Lun","Mar","Mer","Gio","Ven","Sab","Dom"]
-    return np.array([float(km_per_day_dict.get(d, 0.0)) for d in order], dtype=float)
-
-def _is_plugged(ts: pd.Timestamp,
-                km_w: np.ndarray,
-                overnight_start: int,
-                overnight_end: int) -> bool:
-    wd = ts.weekday()
-    wd_next = (ts + pd.Timedelta(days=1)).weekday()
-
-    if km_w[wd] == 0.0:
-        return True
-    if km_w[wd] > 0.0 and ts.hour < overnight_end:
-        return True
-    if km_w[wd_next] > 0.0 and ts.hour >= overnight_start:
-        return True
-    return False
-
-def _departures(index: pd.DatetimeIndex,
-                km_w: np.ndarray,
-                depart_hour: int,
-                depart_min: int) -> List[pd.Timestamp]:
-    tz = index.tz
-    days = pd.to_datetime(index.tz_convert(tz).date).unique()
-    deps: List[pd.Timestamp] = []
-    for d in days:
-        d = pd.Timestamp(d).tz_localize(tz)
-        if km_w[d.weekday()] > 0.0:
-            t = d + pd.Timedelta(hours=depart_hour, minutes=depart_min)
-            if index[0] < t <= index[-1]:
-                deps.append(t)
-    return deps
-
-def plan_ev_from_km(df_hour: pd.DataFrame,
-                    km_per_day: dict,
-                    veh_eff_kwh_per_100km: float = 16.0,
-                    batt_capacity_kwh: float = 60.0,
-                    soc_init_frac: float = 0.6,
-                    soc_min_frac: float = 0.1,
-                    charger_power_kw: float = 7.4,
-                    depart_time: time = time(7,0),
-                    overnight_start_h: int = 20,
-                    overnight_end_h: int = 7) -> pd.Series:
-    idx = df_hour.index
-    tz = idx.tz
-    km_w = _km_dict_to_array(km_per_day)
-    eff_kwh_km = veh_eff_kwh_per_100km / 100.0
-
-    deps = _departures(idx, km_w, depart_time.hour, depart_time.minute)
-    if not deps:
-        return pd.Series(0.0, index=idx)
-
-    ev = pd.Series(0.0, index=idx, dtype=float)
-    soc = soc_init_frac * batt_capacity_kwh
-    soc_min = soc_min_frac * batt_capacity_kwh
-    prev_dep = idx[0]
-
-    for dep in deps:
-        need_kwh = km_w[dep.weekday()] * eff_kwh_km
-        target_before = min(need_kwh + soc_min, batt_capacity_kwh)
-        deficit = max(target_before - soc, 0.0)
-
-        if deficit > 0:
-            mask_seg = (idx > prev_dep) & (idx < dep)
-            if mask_seg.any():
-                cand = idx[mask_seg & idx.map(lambda t: _is_plugged(t, km_w, overnight_start_h, overnight_end_h))]
-                if len(cand) > 0:
-                    pv = df_hour.loc[cand, "PV_kWh"].fillna(0.0)
-                    order = pv.sort_values(ascending=False).index
-                    remaining = deficit
-                    for ts in order:
-                        if remaining <= 0:
-                            break
-                        put = min(charger_power_kw, remaining)
-                        ev.at[ts] += put
-                        remaining -= put
-                    charged = deficit - max(remaining, 0.0)
-                    soc = min(soc + charged, batt_capacity_kwh)
-
-        soc = max(soc - need_kwh, 0.0)
-        prev_dep = dep
-
-    return ev
-
-# -----------------------------------------------------------------------------
-# Planner per disponibilità (via/casa) – multi-slot + look-ahead
-# -----------------------------------------------------------------------------
 def _weekly_plug_mask_multi(slots_cfg: Dict[str, List[Dict]]) -> np.ndarray:
     """
     slots_cfg[day] = [{"active":bool, "start":time, "end":time}, ...]
     Ritorna [7 x 24] True=collegata, False=via. Gestisce slot oltre mezzanotte.
     """
     plug = np.ones((7,24), dtype=bool)
-    base_idx = {d:i for i,d in enumerate(DAYS)}
     for dname, slots in slots_cfg.items():
-        wd = base_idx[dname]
+        wd = DAY_IDX[dname]
         for s in slots:
             if not s.get("active", False):
                 continue
@@ -443,7 +264,6 @@ def _build_deadlines_multi(index: pd.DatetimeIndex,
     tz = index.tz
     days = pd.to_datetime(index.tz_convert(tz).date).unique()
     events = []
-    base_idx = {d:i for i,d in enumerate(DAYS)}
     for d in days:
         dt = pd.Timestamp(d).tz_localize(tz)
         dname = DAYS[dt.weekday()]
@@ -476,8 +296,8 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                           price_map: Optional[Dict[str, float]] = None) -> pd.Series:
     """
     Look-ahead multi-deadline (PV-first).
-    In ogni segmento (tra due partenze) carica per tempo fino a coprire
-    TUTTE le uscite entro lookahead_days (entro limite capacità EV).
+    In ogni segmento tra partenze carica per tempo fino a coprire TUTTE le uscite entro lookahead_days
+    (entro capacità EV). PV prima; se non basta, usa le ore "rest" ordinate per prezzo se fornito.
     """
     idx = df_hour.index
     ev = pd.Series(0.0, index=idx, dtype=float)
@@ -487,7 +307,6 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
     if not deadlines:
         return ev
 
-    # Colonne di supporto
     if "Band" not in df_hour.columns:
         df_hour = df_hour.copy()
         df_hour["Band"] = compute_arera_band(df_hour.index)
@@ -501,7 +320,6 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
         dep = deadlines[j]["ts"]
         need_now = deadlines[j]["need"]
 
-        # fabbisogno cumulato entro lookahead
         horizon_end = dep + pd.Timedelta(days=lookahead_days)
         cum_need = 0.0
         k = j
@@ -521,17 +339,15 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
 
                 good = cand[cand["pv_surplus"] > max(house_batt_headroom_kw, 0.0)].sort_values("pv_surplus", ascending=False)
                 rest = cand.loc[cand.index.difference(good.index)]
-                if price_map is not None:
+                if price_map is not None and len(rest) > 0:
                     rest = rest.assign(price=rest["Band"].map(price_map).fillna(np.inf)) \
-                               .sort_values(by=["price","PV_kWh"], ascending=[True, False])
+                               .sort_values(by=["price", "PV_kWh"], ascending=[True, False])
                 else:
                     rest = rest.sort_values("PV_kWh", ascending=False)
 
-                order = list(good.index) + ([] if prefer_pv_only else list(rest.index))
+                # 1) Solo surplus FV
                 remaining = deficit_total
-
-                # Solo surplus FV (prima passata)
-                for ts in order:
+                for ts in good.index:
                     if remaining <= 0:
                         break
                     room = batt_capacity_kwh - soc
@@ -542,8 +358,8 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                     soc = min(soc + put, batt_capacity_kwh)
                     remaining -= put
 
-                # Se non basta e prefer_pv_only → usa anche 'rest'
-                if remaining > 1e-9 and prefer_pv_only:
+                # 2) Se non basta, usa ore rest (minimo indispensabile, ordinate per prezzo/PV)
+                if remaining > 1e-9 and len(rest) > 0:
                     for ts in rest.index:
                         if remaining <= 0:
                             break
@@ -561,6 +377,41 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
         j += 1
 
     return ev
+
+
+def plan_ev_auto(df_hour: pd.DataFrame,
+                 slots_cfg: dict,
+                 km_per_slot: dict,
+                 veh_eff_kwh_per_100km: float,
+                 batt_capacity_kwh: float,
+                 soc_init_frac: float,
+                 soc_min_frac: float,
+                 charger_power_kw: float,
+                 use_batt: bool,
+                 house_batt_p_charge_kw: float,
+                 price_map: dict) -> pd.Series:
+    """
+    Ottimizzatore automatico:
+      - Look-ahead = 7 giorni
+      - PV-first rigido: prima usa solo ore con surplus FV al netto della batteria di casa
+      - Se non basta entro la deadline: sblocca il minimo di ore restanti, ordinate per prezzo (F3→F2→F1)
+    """
+    headroom = house_batt_p_charge_kw if use_batt else 0.0
+
+    return plan_ev_multideadline(
+        df_hour=df_hour,
+        slots_cfg=slots_cfg,
+        km_per_slot=km_per_slot,
+        veh_eff_kwh_per_100km=veh_eff_kwh_per_100km,
+        batt_capacity_kwh=batt_capacity_kwh,
+        soc_init_frac=soc_init_frac,
+        soc_min_frac=soc_min_frac,
+        charger_power_kw=charger_power_kw,
+        lookahead_days=7,
+        prefer_pv_only=True,
+        house_batt_headroom_kw=headroom,
+        price_map=price_map,
+    )
 
 # -----------------------------------------------------------------------------
 # Sidebar – upload
@@ -614,6 +465,7 @@ if n_dup > 0:
 
 # 1) Collassa duplicati (somma numeriche kWh/ora)
 num_cols = df_filt.select_dtypes(include="number").columns
+
 df_no_dups = (
     df_filt
     .sort_index()
@@ -633,7 +485,7 @@ for c in ["Total", "PV_kWh", "Autocons_kWh"]:
         df_hour[c] = df_hour[c].fillna(0)
 
 # -----------------------------------------------------------------------------
-# 💶 Tariffe (spostate qui per usare i prezzi anche nel planner EV)
+# 💶 Tariffe (usate anche per l'ordinamento ore non-FV nell'EV)
 # -----------------------------------------------------------------------------
 st.sidebar.header("💶 Tariffe")
 price_f1 = st.sidebar.number_input("Prezzo F1 (€/kWh)", min_value=0.0, value=0.30, step=0.01, format="%.3f")
@@ -672,85 +524,28 @@ soc_min = st.sidebar.slider("SOC minimo (%)", min_value=0, max_value=50, value=i
 soc_init= st.sidebar.slider("SOC iniziale (%)", min_value=0, max_value=100, value=int(100*st.session_state.get("soc_init",0.50)), step=5, key="soc_init_pct") / 100.0
 
 # -----------------------------------------------------------------------------
-# 🚗 Auto elettrica – 3 modalità
+# 🚗 Ricarica EV (Auto)
 # -----------------------------------------------------------------------------
 st.sidebar.divider()
-st.sidebar.header("🚗 Ricarica auto elettrica")
+st.sidebar.header("🚗 Ricarica EV (Auto)")
+use_ev = st.sidebar.checkbox("Attiva ricarica EV (ottimizzata FV)", value=True)
 
-ev_mode_ui = st.sidebar.radio(
-    "Modalità EV",
-    ["Per sessione (semplice)", "Pianificatore settimanale (km)", "Planner per disponibilità (via/casa)"],
-    index=2
-)
-use_ev = st.sidebar.checkbox("Attiva ricarica EV", value=False)
-
-# salva carico base
+# salva carico base prima dell'EV
 df_hour["Total_base"] = df_hour.get("Total", 0).copy()
 
-if use_ev and ev_mode_ui == "Per sessione (semplice)":
-    ev_mode = st.sidebar.selectbox("Logica sessione", ["Orario fisso", "PV-priority"], index=1)
-    ev_power = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 3.7, 0.1)
-    ev_energy = st.sidebar.number_input("Energia per sessione (kWh nel pacco EV)", 1.0, 120.0, 10.0, 0.5)
-    ev_eff = st.sidebar.slider("Efficienza AC→batt EV", 0.70, 1.00, 0.92, 0.01)
-    ev_start = st.sidebar.time_input("Ora inizio finestra", value=time(22, 0))
-    ev_window = st.sidebar.slider("Durata finestra (ore)", 1, 12, 8)
-    ev_days = st.sidebar.multiselect("Giorni con sessione", DAYS, default=["Lun", "Mer", "Ven"])
-
-    ev_profile = build_ev_profile(
-        index=df_hour.index, mode=ev_mode, power_kw=ev_power,
-        energy_session_kwh=ev_energy, efficiency_ac_to_batt=ev_eff,
-        start_time=ev_start, window_h=int(ev_window), days_sel=ev_days,
-        pv_series=df_hour.get("PV_kWh", None)
-    )
-    df_hour["EV_kWh"] = ev_profile
-
-elif use_ev and ev_mode_ui == "Pianificatore settimanale (km)":
-    st.sidebar.markdown("Imposta i km per giorno e i parametri veicolo/caricatore.")
-    c1, c2 = st.sidebar.columns(2)
-    km_lun = c1.number_input("Lun (km)", 0, 1000, 140, 10)
-    km_mar = c2.number_input("Mar (km)", 0, 1000, 140, 10)
-    km_mer = c1.number_input("Mer (km)", 0, 1000, 140, 10)
-    km_gio = c2.number_input("Gio (km)", 0, 1000, 0, 10)
-    km_ven = c1.number_input("Ven (km)", 0, 1000, 0, 10)
-    km_sab = c2.number_input("Sab (km)", 0, 1000, 0, 10)
-    km_dom = c1.number_input("Dom (km)", 0, 1000, 0, 10)
-
+if use_ev:
+    # Parametri veicolo/caricatore
     veh_eff = st.sidebar.number_input("Consumo EV (kWh/100 km)", 10.0, 30.0, 16.0, 0.5)
     batt_cap = st.sidebar.number_input("Capacità batteria EV (kWh)", 10.0, 120.0, 60.0, 1.0)
-    soc0 = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
-    soc_res = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
-    p_chg = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
-    dep_time = st.sidebar.time_input("Ora partenza giorni con viaggio", value=time(7, 0))
-    ovn_start = st.sidebar.slider("Overnight: da (h)", 17, 23, 20)
-    ovn_end = st.sidebar.slider("Overnight: a (h)", 5, 10, 7)
+    soc0     = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
+    soc_res  = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
+    p_chg    = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
 
-    km_week = {"Lun": km_lun, "Mar": km_mar, "Mer": km_mer, "Gio": km_gio, "Ven": km_ven, "Sab": km_sab, "Dom": km_dom}
-
-    ev_profile = plan_ev_from_km(
-        df_hour=df_hour,
-        km_per_day=km_week,
-        veh_eff_kwh_per_100km=veh_eff,
-        batt_capacity_kwh=batt_cap,
-        soc_init_frac=soc0,
-        soc_min_frac=soc_res,
-        charger_power_kw=p_chg,
-        depart_time=dep_time,
-        overnight_start_h=int(ovn_start),
-        overnight_end_h=int(ovn_end)
-    )
-    df_hour["EV_kWh"] = ev_profile
-
-elif use_ev and ev_mode_ui == "Planner per disponibilità (via/casa)":
-    st.sidebar.subheader("Slot di assenza (max 2) e km/slot")
-    veh_eff = st.sidebar.number_input("Consumo EV (kWh/100 km)", 10.0, 30.0, 16.0, 0.5)
-    batt_cap = st.sidebar.number_input("Capacità batteria EV (kWh)", 10.0, 120.0, 60.0, 1.0)
-    soc0 = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
-    soc_res = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
-    p_chg = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
-
+    # Routine: fino a 2 slot "via" per giorno + km/slot
     slots_cfg = {d: [] for d in DAYS}
     km_per_slot = {d: [] for d in DAYS}
 
+    st.sidebar.caption("Imposta quando l'auto è VIA (non collegata). Il resto del tempo è collegata e carica FV-first.")
     for d in DAYS:
         with st.sidebar.expander(d, expanded=(d in ["Lun","Ven","Sab","Dom"])):
             # Slot 1 (tipicamente Ufficio)
@@ -758,23 +553,17 @@ elif use_ev and ev_mode_ui == "Planner per disponibilità (via/casa)":
             s1_s   = st.time_input("Slot 1 inizio", key=f"{d}_s1_s", value=time(7,0))
             s1_e   = st.time_input("Slot 1 fine",   key=f"{d}_s1_e", value=time(18,0))
             s1_km  = st.number_input("KM slot 1", 0, 1000, 140 if d in ["Lun","Mar","Mer"] else 0, 10, key=f"{d}_s1_km")
-            slots_cfg[d].append({"active": s1_act, "start": s1_s, "end": s1_e})
-            km_per_slot[d].append(float(s1_km))
+            slots_cfg[d].append({"active": s1_act, "start": s1_s, "end": s1_e}); km_per_slot[d].append(float(s1_km))
 
             # Slot 2 (tipicamente Serale)
             s2_act = st.checkbox("Slot 2 attivo", key=f"{d}_s2_act", value=(d in ["Ven","Sab","Dom"]))
             s2_s   = st.time_input("Slot 2 inizio", key=f"{d}_s2_s", value=time(19,0))
             s2_e   = st.time_input("Slot 2 fine",   key=f"{d}_s2_e", value=time(23,59))
             s2_km  = st.number_input("KM slot 2", 0, 1000, 50 if d in ["Ven","Sab","Dom"] else 0, 10, key=f"{d}_s2_km")
-            slots_cfg[d].append({"active": s2_act, "start": s2_s, "end": s2_e})
-            km_per_slot[d].append(float(s2_km))
+            slots_cfg[d].append({"active": s2_act, "start": s2_s, "end": s2_e}); km_per_slot[d].append(float(s2_km))
 
-    st.sidebar.subheader("Strategia di carica")
-    lookahead_days = st.sidebar.slider("Look-ahead (giorni)", 1, 10, 7)
-    prefer_pv_only = st.sidebar.checkbox("Usa prima SOLO surplus FV", True)
-    respect_house_batt = st.sidebar.checkbox("Non rubare potenza alla batteria di casa", True)
-
-    ev_profile = plan_ev_multideadline(
+    # Esegui ottimizzatore automatico
+    ev_profile = plan_ev_auto(
         df_hour=df_hour,
         slots_cfg=slots_cfg,
         km_per_slot=km_per_slot,
@@ -783,13 +572,11 @@ elif use_ev and ev_mode_ui == "Planner per disponibilità (via/casa)":
         soc_init_frac=soc0,
         soc_min_frac=soc_res,
         charger_power_kw=p_chg,
-        lookahead_days=lookahead_days,
-        prefer_pv_only=prefer_pv_only,
-        house_batt_headroom_kw=(p_ch if (use_batt and respect_house_batt) else 0.0),
-        price_map=_price_map_ev  # opzionale: ordina ore "rest" per prezzo
+        use_batt=use_batt,
+        house_batt_p_charge_kw=p_ch,  # priorità batteria di casa
+        price_map=_price_map_ev,
     )
     df_hour["EV_kWh"] = ev_profile
-
 else:
     df_hour["EV_kWh"] = 0.0
 
@@ -875,6 +662,39 @@ c2.metric("Autoconsumo FV aggiuntivo (kWh)", f"{kwh_autocons_add:,.0f}")
 # -----------------------------------------------------------------------------
 # KPI ricarica EV – copertura da PV/Batteria/Rete
 # -----------------------------------------------------------------------------
+def split_ev_coverage(df_base: pd.DataFrame,
+                      df_with_batt: Optional[pd.DataFrame],
+                      use_batt: bool) -> Dict[str, float]:
+    """Ripartisce EV_kWh tra FV diretto, Batteria e Rete."""
+    pv = df_base["PV_kWh"]
+    total_base = df_base["Total_base"]
+    total_with_ev = df_base["Total"]
+    ev = df_base["EV_kWh"]
+
+    pv_used_with_ev  = np.minimum(pv, total_with_ev)
+    pv_used_baseonly = np.minimum(pv, total_base)
+    ev_from_pv = (pv_used_with_ev - pv_used_baseonly).clip(lower=0)
+
+    ev_rem_after_pv = (ev - ev_from_pv).clip(lower=0)
+
+    if use_batt and df_with_batt is not None and "Batt_Discharge_kWh" in df_with_batt.columns:
+        batt_dis = df_with_batt["Batt_Discharge_kWh"]
+        base_rem_after_pv = (total_base - pv_used_baseonly).clip(lower=0)
+        denom = base_rem_after_pv + ev_rem_after_pv
+        share = np.divide(ev_rem_after_pv, denom, out=np.zeros_like(ev_rem_after_pv), where=denom > 0)
+        ev_from_batt = batt_dis * share
+    else:
+        ev_from_batt = pd.Series(0.0, index=df_base.index)
+
+    ev_from_grid = (ev - ev_from_pv - ev_from_batt).clip(lower=0)
+
+    return {
+        "pv": float(ev_from_pv.sum()),
+        "batt": float(ev_from_batt.sum()),
+        "grid": float(ev_from_grid.sum()),
+        "total": float(ev.sum())
+    }
+
 if use_ev:
     cover = split_ev_coverage(df_hour, df_use if use_batt else None, use_batt=use_batt)
     ev_tot = cover["total"]
@@ -957,12 +777,14 @@ st.plotly_chart(fig_heat, use_container_width=True)
 st.divider()
 
 # =============================================================================
-# 💶 BLOCCO ECONOMICO (riusa le tariffe definite prima)
+# 💶 BLOCCO ECONOMICO
 # =============================================================================
+
 def _fmt_eur(x: float) -> str:
     s = f"{x:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return f"€ {s}"
+
 
 def compute_costs(df_in: pd.DataFrame, import_col: str, export_col: str):
     if "Band" not in df_in.columns:
@@ -980,7 +802,9 @@ def compute_costs(df_in: pd.DataFrame, import_col: str, export_col: str):
     total_import_cost = float(tmp["import_cost"].sum())
     total_export_rev  = float(tmp["export_rev"].sum())
     total_net_cost    = float(tmp["net_cost"].sum())
-    monthly_econ = tmp.resample("MS")[["import_cost", "export_rev", "net_cost"]].sum()
+    monthly_econ = tmp.resample("MS")[
+        ["import_cost", "export_rev", "net_cost"]
+    ].sum()
     return total_import_cost, total_export_rev, total_net_cost, monthly_econ
 
 # Baseline (senza batteria)
