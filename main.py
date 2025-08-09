@@ -335,6 +335,7 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
         if seg_mask.any() and deficit_total > 1e-9:
             cand_idx = idx[seg_mask & idx.map(lambda t: _is_plugged_from_mask(t, plug_mask))]
             if len(cand_idx) > 0:
+                cand = df_hour.loc[cand_idx, ["PV_kWh", "Total_base", "Band"]].copy()
                 cand["surplus_after_base"] = cand["PV_kWh"] - cand["Total_base"]
                 # Quanta potenza realmente la batteria può prendere (da simulazione base-only)
                 if headroom_series is not None:
@@ -383,7 +384,7 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                     room = batt_capacity_kwh - soc
                     if room <= 1e-9:
                         break
-                    put = min(charger_power_kw, remaining, room)
+                    put = min(charger_power_kw, remaining, room, float(good.at[ts, "pv_surplus_ev"]))
                     ev.at[ts] += put
                     soc = min(soc + put, batt_capacity_kwh)
                     remaining -= put
@@ -1069,4 +1070,5 @@ st.download_button(
     file_name=("consumi_pv_con_batteria.csv" if use_batt else "consumi_pv_senza_batteria.csv"),
     mime="text/csv",
 )
+
 
