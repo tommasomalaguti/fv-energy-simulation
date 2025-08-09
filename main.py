@@ -552,6 +552,7 @@ if use_ev:
     p_chg    = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
 
     # Routine: fino a 2 slot "via" per giorno + km/slot
+    DAYS: List[str] = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
     slots_cfg = {d: [] for d in DAYS}
     km_per_slot = {d: [] for d in DAYS}
 
@@ -612,18 +613,18 @@ else:
 # Applica EV al carico e ricalcola grandezze senza batteria
 df_hour["Total"] = df_hour["Total_base"] + df_hour["EV_kWh"]
 df_hour["Autocons_kWh"] = np.minimum(df_hour["PV_kWh"], df_hour["Total"]) 
-df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_KWh"]).clip(lower=0)
-df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_KWh"]).clip(lower=0)
+df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
+df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
 
 # Export/NetGrid naming robusto
 export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
 if export_col is None:
-    df_hour["Export_KWh"] = (df_hour["PV_KWh"] - df_hour["Autocons_KWh"]).clip(lower=0)
+    df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
     export_col = "Export_KWh"
 
 net_col = "NetGrid_KWh" if "NetGrid_KWh" in df_hour.columns else ("NetGrid_kWh" if "NetGrid_KWh" in df_hour.columns else None)
-if net_col is None and {"Total","Autocons_KWh"}.issubset(df_hour.columns):
-    df_hour["NetGrid_KWh"] = (df_hour["Total"] - df_hour["Autocons_KWh"]).clip(lower=0)
+if net_col is None and {"Total","Autocons_kWh"}.issubset(df_hour.columns):
+    df_hour["NetGrid_KWh"] = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
     net_col = "NetGrid_KWh"
 
 # -----------------------------------------------------------------------------
@@ -645,7 +646,7 @@ if use_batt:
     EXPORT   = "Export_KWh_batt"
     df_use   = sim
 else:
-    AUTOCONS = "Autocons_KWh"
+    AUTOCONS = "Autocons_kWh"
     NET      = net_col
     EXPORT   = export_col
     df_use   = df_hour
@@ -654,7 +655,7 @@ else:
 if "Batt_Discharge_kWh" in df_use.columns and "Batt_Discharge_KWh" not in df_use.columns:
     df_use["Batt_Discharge_KWh"] = df_use["Batt_Discharge_kWh"]
 if "Batt_Discharge_KWh" in df_use.columns and "Batt_Discharge_kWh" not in df_use.columns:
-    df_use["Batt_Discharge_kWh"] = df_use["Batt_Discharge_KWh"]
+    df_use["Batt_Discharge_KWh"] = df_use["Batt_Discharge_KWh"]
 
 # -----------------------------------------------------------------------------
 # KPI principali
@@ -672,11 +673,11 @@ col5.metric("Autonomia (%)", f"{autonomy:.1f}%")
 # KPI "Contributo batteria" (vs baseline senza batteria)
 # -----------------------------------------------------------------------------
 baseline = df_hour.copy()  # baseline = stesso carico (incluso EV), ma senza batteria
-if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_KWh"}.issubset(baseline.columns):
-    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_KWh"]).clip(lower=0)
+if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_kWh"}.issubset(baseline.columns):
+    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_kWh"]).clip(lower=0)
 
 prelievo_baseline = baseline["NetGrid_KWh"].sum() if "NetGrid_KWh" in baseline.columns else 0.0
-autocons_baseline = baseline["Autocons_KWh"].sum() if "Autocons_KWh" in baseline.columns else 0.0
+autocons_baseline = baseline["Autocons_kWh"].sum() if "Autocons_kWh" in baseline.columns else 0.0
 
 prelievo_scenario = df_use["NetGrid_KWh_batt"].sum() if use_batt else prelievo_baseline
 autocons_scenario = df_use[AUTOCONS].sum()
@@ -752,11 +753,11 @@ daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
 if use_ev and "EV_kWh" in df_hour.columns:
     daily["EV_kWh"] = df_hour["EV_kWh"].resample("D").sum()
 
-y_cols = ["Total", "PV_kWh"] + (["EV_KWh"] if "EV_KWh" in daily.columns else [])
+y_cols = [c for c in ["Total","PV_kWh","EV_kWh"] if c in daily.columns]
 fig_daily = px.area(
     daily,
     x=daily.index,
-    y=[c for c in ["Total","PV_kWh","EV_kWh"] if c in daily.columns],
+    y=y_cols,
     labels={"value": "kWh al giorno", "variable": ""},
 )
 fig_daily.update_layout(legend_orientation="h", legend_y=-0.2)
@@ -837,8 +838,8 @@ def compute_costs(df_in: pd.DataFrame, import_col: str, export_col: str):
     return total_import_cost, total_export_rev, total_net_cost, monthly_econ
 
 # Baseline (senza batteria)
-if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_KWh"}.issubset(baseline.columns):
-    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_KWh"]).clip(lower=0)
+if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_kWh"}.issubset(baseline.columns):
+    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_kWh"]).clip(lower=0)
 if "Export_KWh" not in baseline.columns and "Export_kWh" in baseline.columns:
     baseline = baseline.rename(columns={"Export_kWh": "Export_KWh"})
 
@@ -1042,3 +1043,7 @@ st.download_button(
     file_name=("consumi_pv_con_batteria.csv" if use_batt else "consumi_pv_senza_batteria.csv"),
     mime="text/csv",
 )
+"""
+code_path.write_text(code_text, encoding="utf-8")
+code_path.as_posix()
+::contentReference[oaicite:0]{index=0}
