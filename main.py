@@ -293,6 +293,7 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
                           lookahead_days: int = 7,
                           prefer_pv_only: bool = True,
                           house_batt_headroom_kw: float = 0.0,
+                          headroom_series: Optional[pd.Series] = None,
                           price_map: Optional[Dict[str, float]] = None) -> pd.Series:
     """
     Look-ahead multi-deadline (PV-first).
@@ -335,9 +336,16 @@ def plan_ev_multideadline(df_hour: pd.DataFrame,
             cand_idx = idx[seg_mask & idx.map(lambda t: _is_plugged_from_mask(t, plug_mask))]
             if len(cand_idx) > 0:
                 cand = df_hour.loc[cand_idx, ["PV_kWh", "Total_base", "Band"]].copy()
-                cand["pv_surplus"] = cand["PV_kWh"] - cand["Total_base"]
+                # Headroom dinamico della batteria di casa (kWh/h); fallback al valore fisso
+                if headroom_series is not None:
+                    cand["headroom"] = headroom_series.reindex(cand.index).fillna(0.0)
+                else:
+                    cand["headroom"] = float(max(house_batt_headroom_kw, 0.0))
 
-                good = cand[cand["pv_surplus"] > max(house_batt_headroom_kw, 0.0)].sort_values("pv_surplus", ascending=False)
+                # Surplus FV realmente disponibile per l'EV in quell'ora
+                cand["pv_surplus_net"] = cand["PV_kWh"] - cand["Total_base"] - cand["headroom"]
+
+                good = cand[cand["pv_surplus_net"] > 0].sort_values("pv_surplus_net", ascending=False)
                 rest = cand.loc[cand.index.difference(good.index)]
                 if price_map is not None and len(rest) > 0:
                     rest = rest.assign(price=rest["Band"].map(price_map).fillna(np.inf)) \
@@ -389,7 +397,8 @@ def plan_ev_auto(df_hour: pd.DataFrame,
                  charger_power_kw: float,
                  use_batt: bool,
                  house_batt_p_charge_kw: float,
-                 price_map: dict) -> pd.Series:
+                 price_map: dict,
+                 headroom_series: Optional[pd.Series] = None) -> pd.Series:
     """
     Ottimizzatore automatico:
       - Look-ahead = 7 giorni
@@ -410,6 +419,7 @@ def plan_ev_auto(df_hour: pd.DataFrame,
         lookahead_days=7,
         prefer_pv_only=True,
         house_batt_headroom_kw=headroom,
+        headroom_series=headroom_series,
         price_map=price_map,
     )
 
@@ -563,6 +573,24 @@ if use_ev:
             slots_cfg[d].append({"active": s2_act, "start": s2_s, "end": s2_e}); km_per_slot[d].append(float(s2_km))
 
     # Esegui ottimizzatore automatico
+    # Headroom dinamico: simula la batteria di casa sul SOLO carico base (senza EV)
+    if use_batt:
+        df_base_only = df_hour.copy()
+        df_base_only["Total"] = df_base_only["Total_base"]
+        sim_base = simulate_battery(
+            df_base_only,
+            capacity_kwh=cap,
+            p_charge_kw=p_ch,
+            p_discharge_kw=p_dis,
+            eta_ch=eta_ch,
+            eta_dis=eta_dis,
+            soc_min_frac=soc_min,
+            soc_init_frac=soc_init
+        )
+        headroom_dyn = sim_base["Batt_Charge_kWh"].reindex(df_hour.index).fillna(0.0)
+    else:
+        headroom_dyn = None
+
     ev_profile = plan_ev_auto(
         df_hour=df_hour,
         slots_cfg=slots_cfg,
@@ -575,6 +603,7 @@ if use_ev:
         use_batt=use_batt,
         house_batt_p_charge_kw=p_ch,  # priorità batteria di casa
         price_map=_price_map_ev,
+        headroom_series=headroom_dyn,
     )
     df_hour["EV_kWh"] = ev_profile
 else:
@@ -582,19 +611,19 @@ else:
 
 # Applica EV al carico e ricalcola grandezze senza batteria
 df_hour["Total"] = df_hour["Total_base"] + df_hour["EV_kWh"]
-df_hour["Autocons_kWh"] = np.minimum(df_hour["PV_kWh"], df_hour["Total"])
-df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
-df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
+df_hour["Autocons_kWh"] = np.minimum(df_hour["PV_kWh"], df_hour["Total"]) 
+df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_KWh"]).clip(lower=0)
+df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_KWh"]).clip(lower=0)
 
 # Export/NetGrid naming robusto
 export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
 if export_col is None:
-    df_hour["Export_KWh"] = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
+    df_hour["Export_KWh"] = (df_hour["PV_KWh"] - df_hour["Autocons_KWh"]).clip(lower=0)
     export_col = "Export_KWh"
 
 net_col = "NetGrid_KWh" if "NetGrid_KWh" in df_hour.columns else ("NetGrid_kWh" if "NetGrid_KWh" in df_hour.columns else None)
-if net_col is None and {"Total","Autocons_kWh"}.issubset(df_hour.columns):
-    df_hour["NetGrid_KWh"] = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
+if net_col is None and {"Total","Autocons_KWh"}.issubset(df_hour.columns):
+    df_hour["NetGrid_KWh"] = (df_hour["Total"] - df_hour["Autocons_KWh"]).clip(lower=0)
     net_col = "NetGrid_KWh"
 
 # -----------------------------------------------------------------------------
@@ -616,7 +645,7 @@ if use_batt:
     EXPORT   = "Export_KWh_batt"
     df_use   = sim
 else:
-    AUTOCONS = "Autocons_kWh"
+    AUTOCONS = "Autocons_KWh"
     NET      = net_col
     EXPORT   = export_col
     df_use   = df_hour
@@ -643,11 +672,11 @@ col5.metric("Autonomia (%)", f"{autonomy:.1f}%")
 # KPI "Contributo batteria" (vs baseline senza batteria)
 # -----------------------------------------------------------------------------
 baseline = df_hour.copy()  # baseline = stesso carico (incluso EV), ma senza batteria
-if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_kWh"}.issubset(baseline.columns):
-    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_kWh"]).clip(lower=0)
+if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_KWh"}.issubset(baseline.columns):
+    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_KWh"]).clip(lower=0)
 
 prelievo_baseline = baseline["NetGrid_KWh"].sum() if "NetGrid_KWh" in baseline.columns else 0.0
-autocons_baseline = baseline["Autocons_kWh"].sum() if "Autocons_kWh" in baseline.columns else 0.0
+autocons_baseline = baseline["Autocons_KWh"].sum() if "Autocons_KWh" in baseline.columns else 0.0
 
 prelievo_scenario = df_use["NetGrid_KWh_batt"].sum() if use_batt else prelievo_baseline
 autocons_scenario = df_use[AUTOCONS].sum()
@@ -723,11 +752,11 @@ daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
 if use_ev and "EV_kWh" in df_hour.columns:
     daily["EV_kWh"] = df_hour["EV_kWh"].resample("D").sum()
 
-y_cols = ["Total", "PV_kWh"] + (["EV_kWh"] if "EV_kWh" in daily.columns else [])
+y_cols = ["Total", "PV_kWh"] + (["EV_KWh"] if "EV_KWh" in daily.columns else [])
 fig_daily = px.area(
     daily,
     x=daily.index,
-    y=y_cols,
+    y=[c for c in ["Total","PV_kWh","EV_kWh"] if c in daily.columns],
     labels={"value": "kWh al giorno", "variable": ""},
 )
 fig_daily.update_layout(legend_orientation="h", legend_y=-0.2)
@@ -808,8 +837,8 @@ def compute_costs(df_in: pd.DataFrame, import_col: str, export_col: str):
     return total_import_cost, total_export_rev, total_net_cost, monthly_econ
 
 # Baseline (senza batteria)
-if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_kWh"}.issubset(baseline.columns):
-    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_kWh"]).clip(lower=0)
+if "NetGrid_KWh" not in baseline.columns and {"Total","Autocons_KWh"}.issubset(baseline.columns):
+    baseline["NetGrid_KWh"] = (baseline["Total"] - baseline["Autocons_KWh"]).clip(lower=0)
 if "Export_KWh" not in baseline.columns and "Export_kWh" in baseline.columns:
     baseline = baseline.rename(columns={"Export_kWh": "Export_KWh"})
 
