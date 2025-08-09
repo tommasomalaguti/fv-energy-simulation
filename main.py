@@ -208,22 +208,21 @@ def simulate_battery(df,
         soc[t] = np.clip(soc_new, soc_min, soc_max)
         soc_prev = soc[t]
 
-    # Usiamo il nome CANONICO 'Batt_Discharge_kWh' (h minuscola).
+    # Alias coerenti
     out["Batt_SOC_kWh"] = soc
     out["Batt_Charge_kWh"] = batt_charge_in
     out["Batt_Discharge_kWh"] = batt_discharge_out
-    # Alias compatibilità: crea anche 'Batt_Discharge_KWh' (H maiuscola)
-    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]
+    out["Batt_Discharge_KWh"] = out["Batt_Discharge_kWh"]  # compatibilità
 
     out["PV_Direct_kWh"] = pv_direct
     out["PV_Surplus_KWh"] = pv_surplus
     out["NetGrid_KWh_batt"] = import_grid
     out["Export_KWh_batt"] = export_grid
-    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_kWh"]
+    out["Autocons_kWh_batt"] = out["PV_Direct_kWh"] + out["Batt_Discharge_KWh"]
     return out
 
 # -----------------------------------------------------------------------------
-# EV charging helpers
+# EV charging helpers (modalità per sessione)
 # -----------------------------------------------------------------------------
 DAYS: List[str] = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 DAY_IDX: Dict[str, int] = {name: i for i, name in enumerate(DAYS)}
@@ -238,15 +237,9 @@ def build_ev_profile(index: pd.DatetimeIndex,
                      days_sel: Optional[List[str]] = None,
                      pv_series: Optional[pd.Series] = None) -> pd.Series:
     """
-    Crea una serie oraria (kWh/h) di ricarica EV sul LATO AC (energia dalla rete/impianto).
-    - mode: 'Orario fisso' → riempie sequenzialmente la finestra
-            'PV-priority' → sceglie le ore con PV più alto nella finestra.
-    - power_kw: potenza massima del caricatore AC per 1h.
-    - energy_session_kwh: energia desiderata *nel pacco batteria* per ogni sessione.
-    - efficiency_ac_to_batt: rendimento (es. 0.92). AC_kWh = energy_session / eff.
-    - start_time + window_h: finestra consentita in ogni giorno selezionato.
-    - days_sel: lista giorni es. ['Lun','Mer','Ven'].
-    - pv_series: PV_kWh oraria usata da 'PV-priority' per ordinare le ore.
+    Serie oraria (kWh/h lato AC) di ricarica EV.
+    - 'Orario fisso': riempie la finestra in ordine.
+    - 'PV-priority': riempie prima le ore con PV più alto nella finestra.
     """
     if days_sel is None:
         days_sel = ["Lun", "Mer", "Ven"]
@@ -257,7 +250,6 @@ def build_ev_profile(index: pd.DatetimeIndex,
     if ac_energy_needed <= 0 or power_kw <= 0 or window_h <= 0:
         return ev
 
-    # Raggruppa per giorno (data locale)
     all_days = pd.to_datetime(index.tz_convert(tz).date).unique()
     sel_idx = {DAY_IDX[d] for d in days_sel if d in DAY_IDX}
 
@@ -292,16 +284,11 @@ def split_ev_coverage(df_base: pd.DataFrame,
                       df_with_batt: Optional[pd.DataFrame],
                       use_batt: bool) -> Dict[str, float]:
     """
-    Stima quanto dell'energia EV (df_base['EV_kWh']) è coperta da:
-      - FV diretto
-      - Batteria (se attiva)
-      - Rete
-    Approccio: prima assegna il PV in eccesso 'incrementale' dovuto all'EV;
-    poi ripartisce la scarica batteria proporzionalmente al residuo di carico.
+    Ripartisce EV_kWh tra FV diretto, Batteria e Rete.
     """
     pv = df_base["PV_kWh"]
-    total_base = df_base["Total_base"]          # carichi senza EV
-    total_with_ev = df_base["Total"]            # carichi con EV
+    total_base = df_base["Total_base"]
+    total_with_ev = df_base["Total"]
     ev = df_base["EV_kWh"]
 
     pv_used_with_ev  = np.minimum(pv, total_with_ev)
@@ -327,6 +314,113 @@ def split_ev_coverage(df_base: pd.DataFrame,
         "grid": float(ev_from_grid.sum()),
         "total": float(ev.sum())
     }
+
+# -----------------------------------------------------------------------------
+# EV planner basato su km/giorno (modalità intelligente)
+# -----------------------------------------------------------------------------
+def _km_dict_to_array(km_per_day_dict: dict) -> np.ndarray:
+    order = ["Lun","Mar","Mer","Gio","Ven","Sab","Dom"]
+    return np.array([float(km_per_day_dict.get(d, 0.0)) for d in order], dtype=float)
+
+def _is_plugged(ts: pd.Timestamp,
+                km_w: np.ndarray,
+                overnight_start: int,
+                overnight_end: int) -> bool:
+    """
+    Regole: 
+      - Giorno senza viaggio (km==0): sempre collegata (tutto il giorno).
+      - Giorno con viaggio (km>0): collegata dalle 00:00 fino a overnight_end (prima della partenza).
+      - Sera del giorno precedente a un viaggio: collegata da overnight_start a 24:00.
+    """
+    wd = ts.weekday()
+    wd_next = (ts + pd.Timedelta(days=1)).weekday()
+
+    if km_w[wd] == 0.0:
+        return True
+    if km_w[wd] > 0.0 and ts.hour < overnight_end:
+        return True
+    if km_w[wd_next] > 0.0 and ts.hour >= overnight_start:
+        return True
+    return False
+
+def _departures(index: pd.DatetimeIndex,
+                km_w: np.ndarray,
+                depart_hour: int,
+                depart_min: int) -> List[pd.Timestamp]:
+    tz = index.tz
+    days = pd.to_datetime(index.tz_convert(tz).date).unique()
+    deps: List[pd.Timestamp] = []
+    for d in days:
+        d = pd.Timestamp(d).tz_localize(tz)
+        if km_w[d.weekday()] > 0.0:
+            t = d + pd.Timedelta(hours=depart_hour, minutes=depart_min)
+            if index[0] < t <= index[-1]:
+                deps.append(t)
+    return deps
+
+def plan_ev_from_km(df_hour: pd.DataFrame,
+                    km_per_day: dict,
+                    veh_eff_kwh_per_100km: float = 16.0,
+                    batt_capacity_kwh: float = 60.0,
+                    soc_init_frac: float = 0.6,
+                    soc_min_frac: float = 0.1,
+                    charger_power_kw: float = 7.4,
+                    depart_time: time = time(7,0),
+                    overnight_start_h: int = 20,
+                    overnight_end_h: int = 7) -> pd.Series:
+    """
+    Genera Serie oraria 'EV_kWh' pianificata dai km/giorno.
+    Obiettivo: prima di ogni partenza avere SOC >= (kWh_viaggio + riserva),
+    caricando nelle ore con PV più alto dove l'auto è collegata.
+    """
+    idx = df_hour.index
+    tz = idx.tz
+    km_w = _km_dict_to_array(km_per_day)
+    eff_kwh_km = veh_eff_kwh_per_100km / 100.0  # kWh per km
+
+    # Lista partenze
+    deps = _departures(idx, km_w, depart_time.hour, depart_time.minute)
+    if not deps:
+        return pd.Series(0.0, index=idx)
+
+    ev = pd.Series(0.0, index=idx, dtype=float)
+
+    # Stato di carica EV (kWh) all'avvio
+    soc = soc_init_frac * batt_capacity_kwh
+    soc_min = soc_min_frac * batt_capacity_kwh
+
+    prev_dep = idx[0]
+
+    for dep in deps:
+        need_kwh = km_w[dep.weekday()] * eff_kwh_km
+        target_before = min(need_kwh + soc_min, batt_capacity_kwh)
+        deficit = max(target_before - soc, 0.0)
+
+        if deficit > 0:
+            # Segmento precedente la partenza, solo ore "collegate"
+            mask_seg = (idx > prev_dep) & (idx < dep)
+            if mask_seg.any():
+                cand = idx[mask_seg & idx.map(lambda t: _is_plugged(t, km_w, overnight_start_h, overnight_end_h))]
+                if len(cand) > 0:
+                    pv = df_hour.loc[cand, "PV_kWh"].fillna(0.0)
+                    order = pv.sort_values(ascending=False).index  # PV-priority
+
+                    remaining = deficit
+                    for ts in order:
+                        if remaining <= 0:
+                            break
+                        put = min(charger_power_kw, remaining)
+                        ev.at[ts] += put
+                        remaining -= put
+
+                    charged = deficit - max(remaining, 0.0)
+                    soc = min(soc + charged, batt_capacity_kwh)
+
+        # Partenza: consumo viaggio
+        soc = max(soc - need_kwh, 0.0)
+        prev_dep = dep
+
+    return ev
 
 # -----------------------------------------------------------------------------
 # Sidebar – upload e preset batteria
@@ -426,45 +520,78 @@ for c in ["Total", "PV_kWh", "Autocons_kWh"]:
         df_hour[c] = df_hour[c].fillna(0)
 
 # -----------------------------------------------------------------------------
-# 🚗 Auto elettrica – profilo di ricarica
+# 🚗 Auto elettrica – modalità semplice o planner per km
 # -----------------------------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.header("🚗 Ricarica auto elettrica")
 
-use_ev = st.sidebar.checkbox("Include ricarica EV", value=False)
-if use_ev:
-    ev_mode = st.sidebar.selectbox("Modalità ricarica", ["Orario fisso", "PV-priority"], index=0)
-    ev_power = st.sidebar.number_input("Potenza caricatore (kW)", min_value=0.5, max_value=22.0, value=3.0, step=0.5)
-    ev_energy = st.sidebar.number_input("Energia per sessione (kWh, nel pacco EV)", min_value=1.0, max_value=120.0, value=10.0, step=0.5)
-    ev_eff = st.sidebar.slider("Efficienza AC→batt EV", min_value=0.70, max_value=1.00, value=0.92, step=0.01)
+ev_mode_ui = st.sidebar.radio("Modalità EV", ["Per sessione (semplice)", "Pianificatore settimanale (km)"], index=1)
+use_ev = st.sidebar.checkbox("Attiva ricarica EV", value=False)
+
+# salva carico base
+df_hour["Total_base"] = df_hour.get("Total", 0).copy()
+
+if use_ev and ev_mode_ui == "Per sessione (semplice)":
+    ev_mode = st.sidebar.selectbox("Logica sessione", ["Orario fisso", "PV-priority"], index=1)
+    ev_power = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 3.7, 0.1)
+    ev_energy = st.sidebar.number_input("Energia per sessione (kWh nel pacco EV)", 1.0, 120.0, 10.0, 0.5)
+    ev_eff = st.sidebar.slider("Efficienza AC→batt EV", 0.70, 1.00, 0.92, 0.01)
     ev_start = st.sidebar.time_input("Ora inizio finestra", value=time(22, 0))
     ev_window = st.sidebar.slider("Durata finestra (ore)", 1, 12, 8)
     ev_days = st.sidebar.multiselect("Giorni con sessione", DAYS, default=["Lun", "Mer", "Ven"])
 
-# Salva il carico base e – se attivo – aggiungi EV al totale
-df_hour["Total_base"] = df_hour.get("Total", 0).copy()
-
-if use_ev:
     ev_profile = build_ev_profile(
-        index=df_hour.index,
-        mode=ev_mode,
-        power_kw=ev_power,
-        energy_session_kwh=ev_energy,
-        efficiency_ac_to_batt=ev_eff,
-        start_time=ev_start,
-        window_h=int(ev_window),
-        days_sel=ev_days,
+        index=df_hour.index, mode=ev_mode, power_kw=ev_power,
+        energy_session_kwh=ev_energy, efficiency_ac_to_batt=ev_eff,
+        start_time=ev_start, window_h=int(ev_window), days_sel=ev_days,
         pv_series=df_hour.get("PV_kWh", None)
     )
     df_hour["EV_kWh"] = ev_profile
-    df_hour["Total"] = df_hour["Total_base"] + df_hour["EV_kWh"]
 
-    # (ri)deriva autoconsumo/export/rete senza batteria (coerenti con il nuovo carico)
-    df_hour["Autocons_kWh"] = np.minimum(df_hour["PV_kWh"], df_hour["Total"])
-    df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
-    df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
+elif use_ev and ev_mode_ui == "Pianificatore settimanale (km)":
+    st.sidebar.markdown("Imposta i km per giorno e i parametri veicolo/caricatore.")
+    c1, c2 = st.sidebar.columns(2)
+    km_lun = c1.number_input("Lun (km)", 0, 1000, 140, 10)
+    km_mar = c2.number_input("Mar (km)", 0, 1000, 140, 10)
+    km_mer = c1.number_input("Mer (km)", 0, 1000, 140, 10)
+    km_gio = c2.number_input("Gio (km)", 0, 1000, 0, 10)
+    km_ven = c1.number_input("Ven (km)", 0, 1000, 0, 10)
+    km_sab = c2.number_input("Sab (km)", 0, 1000, 0, 10)
+    km_dom = c1.number_input("Dom (km)", 0, 1000, 0, 10)
+
+    veh_eff = st.sidebar.number_input("Consumo EV (kWh/100 km)", 10.0, 30.0, 16.0, 0.5)
+    batt_cap = st.sidebar.number_input("Capacità batteria EV (kWh)", 10.0, 120.0, 60.0, 1.0)
+    soc0 = st.sidebar.slider("SOC iniziale EV (%)", 0, 100, 60) / 100.0
+    soc_res = st.sidebar.slider("RISERVA minima EV (%)", 0, 50, 10) / 100.0
+    p_chg = st.sidebar.number_input("Potenza caricatore (kW)", 0.5, 22.0, 7.4, 0.1)
+    dep_time = st.sidebar.time_input("Ora partenza giorni con viaggio", value=time(7, 0))
+    ovn_start = st.sidebar.slider("Overnight: da (h)", 17, 23, 20)
+    ovn_end = st.sidebar.slider("Overnight: a (h)", 5, 10, 7)
+
+    km_week = {"Lun": km_lun, "Mar": km_mar, "Mer": km_mer, "Gio": km_gio, "Ven": km_ven, "Sab": km_sab, "Dom": km_dom}
+
+    ev_profile = plan_ev_from_km(
+        df_hour=df_hour,
+        km_per_day=km_week,
+        veh_eff_kwh_per_100km=veh_eff,
+        batt_capacity_kwh=batt_cap,
+        soc_init_frac=soc0,
+        soc_min_frac=soc_res,
+        charger_power_kw=p_chg,
+        depart_time=dep_time,
+        overnight_start_h=int(ovn_start),
+        overnight_end_h=int(ovn_end)
+    )
+    df_hour["EV_kWh"] = ev_profile
+
 else:
     df_hour["EV_kWh"] = 0.0
+
+# Applica EV al carico e ricalcola grandezze senza batteria
+df_hour["Total"] = df_hour["Total_base"] + df_hour["EV_kWh"]
+df_hour["Autocons_kWh"] = np.minimum(df_hour["PV_kWh"], df_hour["Total"])
+df_hour["NetGrid_KWh"]  = (df_hour["Total"] - df_hour["Autocons_kWh"]).clip(lower=0)
+df_hour["Export_KWh"]   = (df_hour["PV_kWh"] - df_hour["Autocons_kWh"]).clip(lower=0)
 
 # Export/NetGrid naming robusto
 export_col = "Export_KWh" if "Export_KWh" in df_hour.columns else ("Export_kWh" if "Export_KWh" in df_hour.columns else None)
@@ -567,8 +694,8 @@ st.divider()
 # -----------------------------------------------------------------------------
 st.subheader("Andamento giornaliero – Carichi vs Produzione FV")
 daily = df_use[["Total", "PV_kWh"]].resample("D").sum()
-if use_ev and "EV_kWh" in df_use.columns:
-    daily["EV_kWh"] = df_use["EV_kWh"].resample("D").sum()
+if use_ev and "EV_kWh" in df_hour.columns:
+    daily["EV_kWh"] = df_hour["EV_kWh"].resample("D").sum()
 
 y_cols = ["Total", "PV_kWh"] + (["EV_kWh"] if "EV_kWh" in daily.columns else [])
 fig_daily = px.area(
@@ -743,25 +870,16 @@ esc = st.sidebar.number_input("Crescita prezzo energia % (annua)", min_value=0.0
 salvage_pct = st.sidebar.number_input("Valore residuo a fine vita (% CAPEX considerato)", min_value=0.0, max_value=100.0, value=0.0, step=1.0) / 100.0
 
 # --- Risparmio annuo base dal blocco economico ---
-# net_b = costo netto baseline (PV senza batteria)
-# net_s = costo netto scenario (con batteria se attiva; altrimenti = baseline)
-# net_all = costo se tutta l'energia fosse da rete (nessun FV)
 if eval_mode == "PV + Batteria vs Solo Rete":
-    # risparmio rispetto a nessun impianto
     saving0 = max(net_all - net_s, 0.0)
     capex_considered = capex_pv + capex_batt
 else:
-    # risparmio della sola batteria rispetto a PV senza batteria
     saving0 = max(net_b - net_s, 0.0)
     capex_considered = capex_batt
 
-# O&M annuo come % del CAPEX considerato
 om_year = om_pct * capex_considered
-
-# Incentivo: quota annua costante nei primi 'incent_years' anni
 incent_annual = capex_considered * incent_pct / max(incent_years, 1)
 
-# --- Costruzione dei flussi di cassa annuali ---
 initial_cf = -capex_considered
 years_idx = np.arange(1, years + 1, 1)
 
@@ -775,7 +893,6 @@ def _npv(rate, cfs):
     return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cfs))
 
 def _irr(cfs, lo=-0.99, hi=1.5, tol=1e-6, it=200):
-    # semplice bisezione sull'NPV
     def f(r): return _npv(r, cfs)
     a, b = lo, hi
     fa, fb = f(a), f(b)
@@ -796,15 +913,10 @@ cum_val = initial_cf
 cum_disc_val = initial_cf
 
 for t in years_idx:
-    # risparmio con escalation
     saving_t = saving0 * ((1 + esc) ** (t - 1))
-    # incentivo (se previsto)
     incent_t = incent_annual if t <= incent_years else 0.0
-    # O&M
     om_t = om_year
-    # sostituzione batteria nell'anno indicato
     repl_t = (-batt_repl_cost) if (batt_repl_year > 0 and t == batt_repl_year) else 0.0
-    # valore residuo solo nell'ultimo anno
     salvage_t = salvage_pct * capex_considered if t == years else 0.0
 
     cf_t = saving_t + incent_t - om_t + repl_t + salvage_t
@@ -822,18 +934,15 @@ for t in years_idx:
     cum.append(cum_val)
     cum_disc.append(cum_disc_val)
 
-# NPV / IRR / Payback
 npv_val = sum(cash_year_disc) + initial_cf
 irr_val = _irr([initial_cf] + cash_year)
 
-# Payback semplice (non scontato)
 try:
     cum_simple = np.cumsum([initial_cf] + cash_year)
     simple_pb = next(i for i in range(1, len(cum_simple)) if cum_simple[i] >= 0)
 except StopIteration:
     simple_pb = None
 
-# Payback scontato
 try:
     cum_disc_series = np.cumsum([initial_cf] + cash_year_disc)
     disc_pb = next(i for i in range(1, len(cum_disc_series)) if cum_disc_series[i] >= 0)
